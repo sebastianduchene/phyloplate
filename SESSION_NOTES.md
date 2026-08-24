@@ -3,12 +3,12 @@
 ## Project
 A local webapp that turns BEAST X (BEAST 1.x) XML files into plate diagrams
 and probabilistic notation. Originally a viewer; expanded earlier sessions to
-also generate XML from templates (the *builder*).  The builder was removed
-this session; the webapp is now viewer + editor of an existing model.
+also generate XML from templates (the *builder*).  The builder was removed;
+the webapp is now viewer + editor of an existing model.
 
 Repo: `/mnt/c/Users/john/Documents/PhD/Dev/phyloplate`
 
-User: John H. Tay (jtay). Branch: `main`.
+User: John H. Tay (jtay). Branch: `test`.
 
 ## How to run
 ```
@@ -31,39 +31,90 @@ js/layout.js        layered DAG layout (Sugiyama-lite) with plate compaction
 js/render.js        D3 drawing, drag/zoom, tooltips, SVG export
 js/notation.js      DAG -> posterior factorisation + per-factor statements + LaTeX
 js/extras.js        SourceView, audit panel, Search, diffModels, exportBN
-js/mcmc-editor.js   prior / operator / MCMC editor (mutates XML in place)
+js/mcmc-editor.js   PriorDock (right-docked) + McmcEditor (Edit MCMC tab)
 js/d3.v7.min.js     vendored
 ```
 
 `app.js` orchestrates: theme, loading, tabs, sidebar, search, audit,
 toolbar, keyboard shortcuts, drawer, paste, drag-drop,
-compare (right-click → second XML), and the MCMC editor.
+compare (right-click → second XML), and the editor surfaces.
 
 ## Changes this session
 
-### Removed
-- `js/builder.js` (XML generator with templates, palette, FASTA drop,
-  drag-anywhere).
-- Header buttons: `Build new` (`#btn-build`), `Edit in builder`
-  (`#btn-edit-build`).
-- The `#builder` container, all builder-related CSS (`.builder`, `.palette`,
-  `.props`, `.fasta-drop`, etc.).
-- `openBuilder` / `closeBuilder` / `Builder` import + state in `js/app.js`.
-- The `phyloplate:open-builder` event listener.
+### Editor refactor
 
-### Added
-- `js/mcmc-editor.js` — slim editor that operates directly on the loaded
-  XML.  Lists every prior, every operator, and the `<mcmc>`/`<log>`/`<logTree>`
-  rows, with form fields for the editable attributes and a live density
-  preview for each prior.  Edits mutate the XML text in place; the source
-  view, diagram, notation, and audit update from the new XML on every
-  commit (i.e. on blur or Enter).
-- Header button `Edit priors & MCMC` (`#btn-edit`).
-- The `#mcmc-editor` container.
-- An `Export XML` button in the editor header for downloading the edited
-  file.
+The old full-window "Edit priors & MCMC" pane is gone.  The work is now
+split between two surfaces:
 
-### Other direction notes
+- **`PriorDock`** — a right-docked panel (360 px wide) that opens when
+  the user clicks a prior's hyperparameter square **or** a parameter
+  that has priors, in the diagram.  The dock shows one prior at a
+  time: the live density preview is stacked **above** the editable
+  attribute form, both inside a single scrolling container so the
+  two halves never separate.  The dock sizes to its content (no
+  bottom anchor), so it ends naturally after the form rather than
+  stretching to the bottom of the canvas.  Previous/next buttons
+  at the top move between priors on the same parameter.  The SVG is
+  rendered at native size (336 × 208 viewBox) with a 36-px left
+  margin so the rotated y-axis title "density" sits in its own
+  lane, separated from the y-tick labels; the bottom margin (59 px)
+  reserves room for tick labels + a gap + the axis title.
+- **`McmcEditor`** — lives in the right sidebar of the **Source** tab.
+  Three editable sections plus a live prior preview at the top:
+  1. **Priors** — one row per prior with its editable attributes.  The
+     currently-selected prior's density curve is shown in the preview
+     panel at the top; the preview updates as the user types.
+  2. **Operators** — one row per operator with its editable attributes
+     (weight, scaleFactor, size, etc.).
+  3. **MCMC** and **Log & log tree** — one row per `<mcmc>` and
+     `<log>` / `<logTree>` element.
+
+  Clicking a row's header (the slot name + target id) jumps to that
+  element's source line in the XML on the left.  Clicking the form
+  fields does not trigger a jump.  The user edits a field and
+  watches the underlying XML update on the left.  An "Export XML"
+  button in the Source tab bar downloads the edited file.  The
+  diagram's right-docked `PriorDock` is still available for
+  editing a single prior with the larger preview.
+
+Both surfaces operate on the XML text in place (regex on
+`<tag attrs/>` plus a body scan for `idref`) so the source view stays
+byte-identical when the user only edits attribute values.  The
+preview graph and the edit form share a single vertical scroll
+container inside the dock so the curve and the inputs cannot drift
+out of alignment.
+
+### Prior PDF x-axis
+
+The x-axis is on a log scale whenever the support spans more than a
+factor of 5, which catches `logNormal`, `exponential`, and `gamma`
+with `shape < 1` or wide range.  `normal`, `laplace`, `uniform`, and
+`beta` stay on a linear axis.  An offset marker (dashed vertical
+line + label) is now drawn at `offsetAt` for the prior kinds that
+support an offset, so the user can see the offset's effect on the
+plot.
+
+### Offset
+
+The `offset` attribute is now respected by `logNormal`, `exponential`,
+`gamma`, `normal`, `laplace`, and `beta` in the preview plot.  The
+density is sampled from `offset` upward (e.g. `gammapdf(x - offset,
+k, theta)` for `gamma`), the x-axis is shifted to start at
+`max(0, offset)`, and a dashed offset marker is drawn at the offset
+position.  Editing the offset field in the dock's form updates the
+preview live (every keystroke) and commits to the XML on blur or
+Enter.
+
+### Other
+
+- Tab order is now Diagram → Edit MCMC → Source → Notation.  Keyboard
+  shortcuts: 1 = Diagram, 2 = Edit MCMC, 3 = Source, 4 = Notation.
+- Removed header button `Edit priors & MCMC` (`#btn-edit`) and the
+  old `#mcmc-editor` container.
+- `state.flash` messages surface edit failures and parse errors via
+  the existing `statusFlash` helper.
+
+## Other direction notes
 
 The viewer is unchanged. Features it has (added in previous sessions):
 - Source XML view with line highlighting (click a node → jump to its lines).
@@ -75,24 +126,10 @@ The viewer is unchanged. Features it has (added in previous sessions):
 - Theme toggle (◐ in header): light / dark / auto (follows prefers-color-scheme).
 - Wider sidebar (320 px) with module list, view toggles, audit, legend.
 - Inline canvas toolbar (fit, zoom, search, modules, machinery).
-- Keyboard shortcuts: F, +/=, −/_, /, M, G, 1/2/3, R, Esc.
+- Keyboard shortcuts: F, +/=, −/_, /, M, G, 1/2/3/4, R, Esc.
 - Sticky filename chip in the header.
 - Mobile drawer for the sidebar (≤920 px).
 - Notation collapsible sections.
-
-### Prior PDF x-axis
-
-User complained the x-axis was out of scale and right-tail skewed for
-positively-supported distributions.  The editor now uses a **log scale**
-when the support spans more than a factor of 5, which catches:
-- `logNormal` (always, since `xMax/xMin = exp(9*sigma)` is huge for any
-  reasonable σ).
-- `exponential` (range `[0.0001·mean, 12·mean]`).
-- `gamma` when `shape < 1` (always, since the density has a pole at 0) or
-  when the range is wide.
-- `oneOnX` (improper, always).
-`normal`, `laplace`, `uniform`, and `beta` stay on a linear axis because
-they're not right-tailed.
 
 ## Things to watch out for
 
@@ -111,8 +148,8 @@ they're not right-tailed.
   real `MouseEvent` and calling `dispatchEvent` (D3 `.dispatch` doesn't take
   event objects).
 
-### MCMC editor
-- Operates on the XML text directly (regex on `<tag attrs/>` and a body
+### PriorDock / McmcEditor
+- Operate on the XML text directly (regex on `<tag attrs/>` and a body
   scan for `idref`), not on a parsed DOM, so the source view stays
   byte-identical when the user only edits attribute values.
 - Prior inputs commit on `change` (blur / Enter); `input` (every keystroke)
@@ -139,4 +176,7 @@ they're not right-tailed.
 - BN export uses placeholder CPDs; intended for structure-only
   consumption by learners that fit parameters from data.
 - Layout is heuristic; the README warns large models may need dragging.
+- On narrow viewports (<720 px) the prior dock goes full-width and stacks
+  preview above form, so the side-by-side layout becomes a top/bottom
+  layout.  Acceptable on phones; desktop users see the side-by-side.
 

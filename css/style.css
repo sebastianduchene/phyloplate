@@ -687,14 +687,39 @@ table.audit-table tr:hover td {
 
 /* ------------------------------------------------------------------ source */
 
+/* The source tab is split horizontally: the XML body on the left, the
+ * MCMC form sidebar on the right.  The body scrolls independently of
+ * the sidebar so the form stays put while the user walks through the
+ * file.  At narrow widths the sidebar drops below the body. */
 .source-pane {
   position: absolute; inset: 0; overflow: auto;
-  background: var(--surface-1); padding: 18px 22px;
+  background: var(--surface-1);
+  display: flex; flex-direction: row;
+  align-items: stretch;
+}
+.source-pane[hidden] { display: none; }
+.source-pane .source-body {
+  flex: 1 1 auto; min-width: 0;
+  overflow: auto;
+  padding: 18px 22px;
   font-family: var(--mono); font-size: 12.5px; line-height: 1.5;
   display: flex; flex-direction: column;
 }
-.source-pane[hidden] { display: none; }
-.source-pane .src-head {
+.source-pane .source-mcmc {
+  flex: 0 0 340px;
+  overflow: auto;
+  background: var(--surface-0);
+  border-left: 1px solid var(--line-strong);
+  padding: 14px 16px 24px;
+}
+@media (max-width: 920px) {
+  .source-pane { flex-direction: column; }
+  .source-pane .source-mcmc {
+    flex: 0 0 auto; border-left: 0;
+    border-top: 1px solid var(--line-strong);
+  }
+}
+.source-pane .source-body .src-head {
   position: sticky; top: -18px;
   background: var(--surface-1);
   margin: -18px -22px 12px;
@@ -703,39 +728,39 @@ table.audit-table tr:hover td {
   display: flex; align-items: center; gap: 10px;
   z-index: 5;
 }
-.source-pane .src-head .src-label {
+.source-pane .source-body .src-head .src-label {
   font-family: var(--font); font-size: 12px; color: var(--text-faint);
 }
-.source-pane .src-head .src-current {
+.source-pane .source-body .src-head .src-current {
   font-family: var(--mono); font-size: 12px; color: var(--teal-700);
 }
-.source-pane pre.src-body {
+.source-pane .source-body .src-body {
   margin: 0; padding: 0; font: inherit; white-space: pre;
   flex: 1; min-height: 0;
 }
-.source-pane .src-line {
+.source-pane .source-body .src-line {
   display: grid; grid-template-columns: 42px 1fr;
   cursor: default;
 }
-.source-pane .src-line:hover { background: color-mix(in srgb, var(--teal-500) 8%, transparent); }
-.source-pane .src-line.hi {
+.source-pane .source-body .src-line:hover { background: color-mix(in srgb, var(--teal-500) 8%, transparent); }
+.source-pane .source-body .src-line.hi {
   background: color-mix(in srgb, var(--orange) 18%, transparent);
 }
-.source-pane .src-line.dim { opacity: .55; }
-.source-pane .src-line .ln {
+.source-pane .source-body .src-line.dim { opacity: .55; }
+.source-pane .source-body .src-line .ln {
   text-align: right; padding-right: 12px;
   color: var(--text-faint); user-select: none;
   border-right: 1px solid var(--line);
 }
-.source-pane .src-line.hi .ln {
+.source-pane .source-body .src-line.hi .ln {
   color: var(--orange); font-weight: 600;
 }
-.source-pane .src-line .code { padding-left: 12px; }
-.source-pane .src-line .code .tag { color: var(--teal-700); }
-.source-pane .src-line .code .attr { color: var(--orange-dark); }
-.source-pane .src-line .code .str { color: #2e7d32; }
-.source-pane html[data-theme="dark"] .source-pane .src-line .code .str { color: #84e88e; }
-.source-pane .src-line .code .com { color: var(--text-faint); font-style: italic; }
+.source-pane .source-body .src-line .code { padding-left: 12px; }
+.source-pane .source-body .src-line .code .tag { color: var(--teal-700); }
+.source-pane .source-body .src-line .code .attr { color: var(--orange-dark); }
+.source-pane .source-body .src-line .code .str { color: #2e7d32; }
+.source-pane html[data-theme="dark"] .source-body .src-line .code .str { color: #84e88e; }
+.source-pane .source-body .src-line .code .com { color: var(--text-faint); font-style: italic; }
 
 /* ------------------------------------------------------------------ toolbar */
 
@@ -793,153 +818,247 @@ table.audit-table tr:hover td {
 }
 .status-flash.visible { opacity: 1; transform: translateX(-50%) translateY(0); }
 
-/* ------------------------------------------------------------------ MCMC editor */
+/* --------------------------------------------------------------- prior dock */
 
-.mcmc-editor {
-  position: absolute; inset: 0;
+/* The right-docked prior editor.  Sits inside the canvas overlay; the
+ * diagram still renders on the left.  The dock sizes to its content
+ * (no bottom anchor) so it ends naturally after the edit-parameters
+ * form.  When the content is taller than the viewport it scrolls
+ * internally; otherwise it floats at the top of the canvas. */
+.prior-dock {
+  position: absolute; top: 12px; right: 12px;
+  width: 360px; max-width: 60vw;
+  max-height: calc(100% - 24px);
   display: flex; flex-direction: column;
   background: var(--surface-0);
-  z-index: 5;
+  border: 1px solid var(--line-strong);
+  border-radius: 6px;
+  z-index: 4;
+  box-shadow: 0 4px 14px rgba(0,0,0,.12);
+  overflow: hidden;
 }
-.mcmc-editor .me-head {
+.prior-dock[hidden] { display: none; }
+.prior-dock-head {
   display: flex; align-items: center;
+  padding: 8px 12px;
   background: var(--surface-1);
   border-bottom: 1px solid var(--line-strong);
-  padding: 8px 14px;
-  gap: 12px;
+  flex: 0 0 auto;
 }
-.mcmc-editor .me-head h2 {
-  margin: 0; font-size: 15px; color: var(--teal-700);
+.prior-dock-title {
+  flex: 1; font-size: 13px; font-weight: 600;
+  color: var(--teal-700);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
-.mcmc-editor .me-spacer { flex: 1; }
-.mcmc-editor .me-close {
+.prior-dock-close {
   font: inherit; font-size: 22px;
   background: none; border: 0; color: var(--text-mute);
   cursor: pointer; line-height: 1; padding: 0 6px;
 }
-.mcmc-editor .me-close:hover { color: var(--text); }
-.mcmc-editor .me-export {
-  font: inherit; font-size: 12px;
-  padding: 5px 10px; border-radius: 4px;
-  background: var(--teal-500); color: #fff;
-  border: 0; cursor: pointer;
+.prior-dock-close:hover { color: var(--text); }
+.prior-dock-body {
+  flex: 0 0 auto;
+  display: flex; flex-direction: column;
+  overflow-y: auto; overflow-x: hidden;
 }
-.mcmc-editor .me-export:hover { background: var(--teal-700); }
-.mcmc-editor .me-body {
-  flex: 1; overflow-y: auto;
-  padding: 16px 22px 40px;
-  max-width: 920px; width: 100%;
-}
-.mcmc-editor .me-body section {
-  margin-bottom: 24px;
-}
-.mcmc-editor .me-body h3 {
-  font-size: 11px; text-transform: uppercase; letter-spacing: .9px;
-  color: var(--teal-700); font-weight: 700;
-  margin: 6px 0 10px; padding-bottom: 5px;
+.prior-dock .pd-head {
+  flex: 0 0 auto;
+  padding: 12px 14px 6px;
   border-bottom: 1px solid var(--line);
 }
-.mcmc-editor .me-count {
-  font-family: var(--mono); font-size: 11px;
-  color: var(--text-faint); margin-left: 4px; font-weight: 400;
+.prior-dock .pd-head-row {
+  display: flex; align-items: center; gap: 8px;
+  margin-bottom: 4px;
 }
-.mcmc-editor .slot {
-  background: var(--surface-1);
-  border: 1px solid var(--line);
-  border-radius: 5px;
-  padding: 9px 12px; margin-bottom: 8px;
+.prior-dock .pd-head-row strong {
+  font-size: 13px; color: var(--text);
 }
-.mcmc-editor .slot .slot-head {
-  display: flex; align-items: center; gap: 10px;
-}
-.mcmc-editor .slot .slot-head strong {
-  font-size: 12.5px; color: var(--text); font-weight: 600;
-  text-transform: none; letter-spacing: 0;
-}
-.mcmc-editor .slot .slot-target {
+.prior-dock .pd-target {
   font-family: var(--mono); font-size: 11.5px;
   color: var(--text-mute);
   background: var(--surface-2);
   padding: 1px 6px; border-radius: 3px;
 }
-.mcmc-editor .slot.selected {
-  border-color: var(--teal-500);
-  box-shadow: inset 3px 0 0 var(--orange);
+.prior-dock .pd-siblings {
+  font-size: 11.5px; color: var(--text-mute);
 }
-.mcmc-editor .slot .slot-edit {
-  margin-top: 6px;
+.prior-dock .pd-sib {
+  font: inherit; font-size: 11px;
+  background: none; border: 1px solid var(--line);
+  color: var(--text-mute);
+  padding: 2px 7px; border-radius: 3px;
+  cursor: pointer;
 }
-.mcmc-editor .slot .slot-edit summary {
-  cursor: pointer; font-size: 11.5px;
-  color: var(--teal-700); user-select: none;
-  margin-bottom: 4px;
+.prior-dock .pd-sib:not(:disabled):hover {
+  background: var(--surface-1); color: var(--text);
 }
-.mcmc-editor .slot label {
+.prior-dock .pd-sib:disabled {
+  opacity: 0.4; cursor: default;
+}
+.prior-dock .pd-sib-count {
+  font-family: var(--mono); font-size: 10.5px;
+  color: var(--text-faint);
+}
+.prior-dock .pd-info {
+  margin: 4px 0 0; font-size: 12px;
+  color: var(--text-mute); line-height: 1.45;
+}
+/* Stack: preview (top) and form (bottom) share one vertical scroll so
+ * the user can scroll the form while the curve stays put above it. */
+.prior-dock .pd-stack {
+  flex: 1 1 auto; min-height: 0;
+  display: flex; flex-direction: column;
+}
+.prior-dock .pd-preview {
+  flex: 0 0 auto;
+  padding: 10px 12px;
+  background: var(--surface-0);
+  border-bottom: 1px solid var(--line);
+}
+.prior-dock .pd-preview-plot {
+  background: var(--surface-1);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 6px;
+  color: var(--teal-900);
+}
+.prior-dock .pd-preview-plot svg {
+  display: block; width: 100%; height: auto;
+}
+.prior-dock .pd-form {
+  flex: 0 0 auto;
+  padding: 10px 12px 24px;
+  display: flex; flex-direction: column; gap: 4px;
+}
+.prior-dock .pd-form label {
   display: block; font-size: 11.5px; color: var(--text-mute);
-  margin: 6px 0 2px;
+  margin: 8px 0 2px;
 }
-.mcmc-editor .slot input[type="text"],
-.mcmc-editor .slot input[type="number"],
-.mcmc-editor .slot select {
+.prior-dock .pd-form input[type="text"],
+.prior-dock .pd-form input[type="number"],
+.prior-dock .pd-form select {
   width: 100%; font: inherit; font-size: 12.5px;
   padding: 4px 7px; border: 1px solid var(--line);
   border-radius: 4px; background: var(--surface-0);
   color: var(--text); outline: none;
   transition: border-color .12s, box-shadow .12s;
 }
-.mcmc-editor .slot input:focus,
-.mcmc-editor .slot select:focus {
+.prior-dock .pd-form input:focus,
+.prior-dock .pd-form select:focus {
   border-color: var(--teal-500);
   box-shadow: 0 0 0 2px color-mix(in srgb, var(--teal-500) 18%, transparent);
 }
-.mcmc-editor .hint {
-  font-size: 12px; color: var(--text-faint); font-style: italic;
-  padding: 6px 0;
+
+@media (max-width: 720px) {
+  .prior-dock { width: 100vw; }
 }
 
-/* Single unified prior preview pane.  Sits at the top of the editor; the
- * dropdown chooses which prior's density to draw, and the row that owns
- * the input the user is currently editing is highlighted as the
- * "selected" row. */
-.mcmc-editor .me-preview {
+/* ----------------------------------------------------------- Edit MCMC tab */
+
+/* The MCMC editor now lives in the right sidebar of the Source tab.
+ * The selectors below match both the legacy .mcmc-pane (in case
+ * something still references it) and the new .source-mcmc wrapper. */
+.source-mcmc .mcmc-pane-head { margin-bottom: 14px; }
+.source-mcmc .mcmc-pane-head h2 {
+  font-size: 14px; color: var(--teal-700); margin: 0 0 4px;
+}
+.source-mcmc .mcmc-pane-sub {
+  font-size: 11.5px; color: var(--text-mute);
+  margin: 0; line-height: 1.5;
+}
+/* Prior preview at the top of the sidebar.  Shown when a prior is
+ * selected; updates live as the user edits the prior's form fields. */
+.source-mcmc .mcmc-prior-preview {
   background: var(--surface-1);
   border: 1px solid var(--line);
-  border-radius: 6px;
-  padding: 12px 16px;
-  margin-bottom: 22px;
+  border-radius: 5px;
+  padding: 10px 12px;
+  margin-bottom: 16px;
 }
-.mcmc-editor .me-preview-bar {
-  display: flex; align-items: center; gap: 8px;
-  margin-bottom: 8px;
+.source-mcmc .mcmc-prior-preview:empty { display: none; }
+.source-mcmc .mcmc-prior-preview .mpp-head {
+  display: flex; align-items: center; gap: 6px;
+  margin-bottom: 6px;
 }
-.mcmc-editor .me-preview-bar label {
-  font-size: 11.5px; text-transform: uppercase; letter-spacing: .9px;
-  color: var(--teal-700); font-weight: 700;
+.source-mcmc .mcmc-prior-preview .mpp-head strong {
+  font-size: 12.5px; color: var(--text);
 }
-.mcmc-editor .me-preview-bar select {
-  flex: 1; font: inherit; font-size: 13px;
-  padding: 5px 8px; border: 1px solid var(--line);
-  border-radius: 4px; background: var(--surface-0);
-  color: var(--text);
+.source-mcmc .mcmc-prior-preview .mpp-head code {
+  font-family: var(--mono); font-size: 11px;
+  color: var(--text-mute);
+  background: var(--surface-2);
+  padding: 1px 5px; border-radius: 3px;
 }
-.mcmc-editor .me-preview-bar select code {
-  font-family: var(--mono); font-size: 11.5px;
-}
-.mcmc-editor .me-preview-plot {
+.source-mcmc .mcmc-prior-preview .mpp-plot {
   background: var(--surface-0);
   border: 1px solid var(--line);
   border-radius: 4px;
-  padding: 6px;
+  padding: 4px;
   color: var(--teal-900);
 }
-.mcmc-editor .me-preview-plot svg {
+.source-mcmc .mcmc-prior-preview .mpp-plot svg {
   display: block; width: 100%; height: auto;
-  max-height: 260px;
 }
-.mcmc-editor .me-preview-desc {
-  margin: 8px 0 0;
-  font-size: 12.5px; color: var(--text-mute);
-  line-height: 1.5;
+.source-mcmc .mcmc-prior-preview .mpp-info {
+  margin: 6px 0 0; font-size: 11px;
+  color: var(--text-mute); line-height: 1.4;
+}
+.source-mcmc section { margin-bottom: 18px; }
+.source-mcmc section h3 {
+  font-size: 11px; text-transform: uppercase; letter-spacing: .9px;
+  color: var(--teal-700); font-weight: 700;
+  margin: 6px 0 8px; padding-bottom: 4px;
+  border-bottom: 1px solid var(--line);
+}
+.source-mcmc .slot {
+  background: var(--surface-1);
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  padding: 8px 10px; margin-bottom: 6px;
+}
+.source-mcmc .slot.selected {
+  border-color: var(--teal-500);
+  box-shadow: inset 3px 0 0 var(--orange);
+}
+.source-mcmc .slot .slot-head {
+  display: flex; align-items: center; gap: 8px;
+  margin-bottom: 2px;
+}
+.source-mcmc .slot .slot-head strong {
+  font-size: 12px; color: var(--text); font-weight: 600;
+  text-transform: none; letter-spacing: 0;
+}
+.source-mcmc .slot .slot-target {
+  font-family: var(--mono); font-size: 11px;
+  color: var(--text-mute);
+  background: var(--surface-2);
+  padding: 1px 5px; border-radius: 3px;
+}
+.source-mcmc .slot label {
+  display: block; font-size: 11px; color: var(--text-mute);
+  margin: 4px 0 2px;
+}
+.source-mcmc .slot input[type="text"],
+.source-mcmc .slot input[type="number"],
+.source-mcmc .slot select {
+  width: 100%; font: inherit; font-size: 12px;
+  padding: 3px 6px; border: 1px solid var(--line);
+  border-radius: 4px; background: var(--surface-0);
+  color: var(--text); outline: none;
+  transition: border-color .12s, box-shadow .12s;
+}
+.source-mcmc .slot input:focus,
+.source-mcmc .slot select:focus {
+  border-color: var(--teal-500);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--teal-500) 18%, transparent);
+}
+.source-mcmc .me-count {
+  font-family: var(--mono); font-size: 11px;
+  color: var(--text-faint); margin-left: 4px; font-weight: 400;
+}
+.source-mcmc .hint {
+  font-size: 11.5px; color: var(--text-faint); font-style: italic;
+  padding: 4px 0;
 }
 
 /* diff view (model comparison) */

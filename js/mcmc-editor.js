@@ -1,29 +1,26 @@
 /* Prior / operator / MCMC editor.
  *
- * Operates directly on the loaded XML text (not on the parsed DAG).  For each
- * prior, operator, and MCMC parameter exposed by the parser, the editor builds
- * a row with the right form fields.  Edits mutate the XML via a tiny DOM
- * helper, then call the registered onApply callback so the viewer can
- * re-parse and re-render.
+ * Two UI surfaces share a single XML-edit pipeline:
  *
- * The original builder (template-based, FASTA drop, drag-drop) was removed in
- * this revision.  We keep only the parts that edit a *loaded* model.
+ *  1. `PriorDock` — a right-docked panel that opens when the user clicks
+ *     a prior (or its target parameter) in the diagram.  The dock renders
+ *     one prior at a time: a live density preview on the left, the
+ *     editable attribute form on the right.  The two halves share the
+ *     same vertical viewport, so the form and the curve never scroll
+ *     apart.
+ *
+ *  2. `McmcEditor` — fills the "Edit MCMC" tab.  Lists every operator
+ *     grouped by target, plus a row for the <mcmc> element and one per
+ *     <log>/<logTree> element.
+ *
+ * Both surfaces mutate the XML text in place (regex on `<tag attrs/>` plus
+ * a body scan for `idref`), and call the registered onApply callback so
+ * the viewer re-parses and re-renders.
+ *
+ * The previous full-window "Edit priors & MCMC" pane (one row per prior
+ * with a global preview at the top) is gone; the per-prior preview now
+ * lives in the dock so it sits next to its own edit form.
  */
-
-/* ---------------------------------------------------------------- exports */
-
-/* SVG density plot for a single prior.  Returns an SVG string.
- *
- *  - `compact`: small inline preview (no axes); retained for callers that
- *    still want a thumbnail.
- *  - otherwise: full plot with axes, ticks, and labels, used in the
- *    editor's preview pane.
- *
- * For positively-supported distributions (logNormal, exponential, gamma,
- * oneOnX), the x-axis uses a log scale when the value range spans more
- * than a factor of 5, otherwise linear.  This keeps the mode visible
- * while preventing the long right tail from squashing the curve into a
- * spike. */
 
 const PRIOR_KINDS = [
   'logNormal', 'exponential', 'normal', 'gamma', 'uniform', 'beta',
@@ -39,14 +36,15 @@ const PRIOR_INFO = {
   },
   exponential: {
     label: 'Exponential',
-    text: 'Memoryless decay on x \u2265 0.  mean is the mean of the ' +
+    text: 'Memoryless decay on x \u2265 offset.  mean is the mean of the ' +
           'distribution (BEAST uses mean, not rate \u03BB = 1/mean).',
   },
   gamma: {
     label: 'Gamma',
-    text: 'Strictly positive, flexible shape. shape and stdev fields encode ' +
+    text: 'Strictly positive, flexible shape. shape and scale fields encode ' +
           'shape \u03B1 and scale \u03B8 so mean = \u03B1\u00B7\u03B8 and ' +
-          'var = \u03B1\u00B7\u03B8\u00B2.',
+          'var = \u03B1\u00B7\u03B8\u00B2.  An offset shifts the support to ' +
+          'x \u2265 offset.',
   },
   invgamma: {
     label: 'Inverse gamma',
@@ -72,7 +70,8 @@ const PRIOR_INFO = {
     label: 'Beta',
     text: 'Density on [0, 1].  shape1 = \u03B1, shape2 = \u03B2.  ' +
           '\u03B1 = \u03B2 = 1 is uniform; \u03B1, \u03B2 > 1 puts mass ' +
-          'in the middle; one of them < 1 puts mass at one endpoint.',
+          'in the middle; one of them < 1 puts mass at one endpoint.  An ' +
+          'offset+scale shifts the support to [offset, offset+scale].',
   },
   cauchy: {
     label: 'Cauchy',
@@ -140,23 +139,17 @@ function logspace(a, b, n) {
 
 const num = v => (v === '' || v == null) ? NaN : Number(v);
 
-/* Returns { xs, ys, logScale, xLabel } for a prior.  `p` is the
- * {kind, mean, stdev, shape, scale, offset, lower, upper, ...} object the
- * editor builds from the parsed XML.  Attribute names follow the BEAST X
- * XML convention so that values copied straight from the parser flow into
- * the chart without translation.
+/* Returns { xs, ys, logScale, xLabel, offsetPos } for a prior.
  *
- * The x-axis is in log scale whenever the support spans more than a factor of
- * 5 (so logNormal / exponential / gamma don't get crushed by their right
- * tail), otherwise linear.  This is what the user wants: a curve that you
- * can read, not a hairline on the left edge of the chart.
+ * `offsetPos` is the (x, y) position of the offset marker in plot units
+ * — null if the prior has no offset.  We always return the offset even
+ * when offset === 0 because the user might edit it; the marker just sits
+ * at the left edge of the support in that case.
  *
- * Range is chosen to cover ~99.5% of the mass where possible. */
+ * The x-axis uses log scale whenever the support spans more than a
+ * factor of 5 (so logNormal / exponential / gamma don't get crushed by
+ * their right tail), otherwise linear. */
 function samplePrior(p, N = 200) {
-  /* Each distribution's parameters.  We accept both the BEAST X spelling
-   * (`shape` / `scale` for gamma; `mean` / `stdev` for logNormal) and the
-   * generic spellings used elsewhere (shape1 / shape2 / scale) so values
-   * flow in from either source. */
   const mu    = num(p.mean);
   const sigma = num(p.stdev);
   const shape = num(p.shape) || num(p.shape1);
@@ -165,13 +158,15 @@ function samplePrior(p, N = 200) {
   const hi    = num(p.upper);
   const offset = Number(p.offset || 0);
   let xs, ys, xLabel = 'x', logScale = false;
+  let offsetAt = null;
 
   if (p.kind === 'logNormal') {
     /* BEAST X's logNormalPrior uses two conventions for `mean` and `stdev`,
      * selected by `meanInRealSpace`.  When false (the BEAST default),
-     * mean and stdev are the mu and sigma of ln X — the curve's "log
-     * scale" parameters.  When true, mean and stdev are the real-space
-     * mean and SD of X, which we convert to log-space parameters. */
+     * mean and stdev are the mu and sigma of ln X.  When true, they are
+     * the real-space mean and SD of X, which we convert to log-space
+     * parameters.  An `offset` shifts the support right by `offset`, so
+     * the density is lnpdf(x - offset, m, s) for x >= offset. */
     let m, s;
     if (p.meanInRealSpace === 'true' && isFinite(mu) && mu > 0 && isFinite(sigma) && sigma > 0) {
       const v = sigma * sigma;
@@ -181,18 +176,25 @@ function samplePrior(p, N = 200) {
       m = isFinite(mu) ? mu : 0;
       s = (isFinite(sigma) && sigma > 0) ? sigma : 1;
     }
-    const xMin = Math.max(1e-9, Math.exp(m - 4 * s));
-    const xMax = Math.exp(m + 5 * s);
+    const loEff = Math.max(offset, 0);
+    const xMin = Math.max(1e-9, loEff + Math.exp(m - 4 * s));
+    const xMax = loEff + Math.exp(m + 5 * s);
     xs = logspace(xMin, xMax, N);
-    ys = xs.map(x => lnpdf(x, m, s));
+    ys = xs.map(x => lnpdf(x - loEff, m, s));
     logScale = (xMax / xMin) > 5;
     xLabel = 'x';
+    offsetAt = offset > 0 ? offset : null;
   } else if (p.kind === 'exponential') {
     const m = isFinite(mu) && mu > 0 ? mu : 1;
-    xs = linspace(m * 1e-4, m * 12, N);
-    ys = xs.map(x => exppdf(x, m));
-    logScale = 12 > 5;
+    const loEff = Math.max(offset, 0);
+    /* For an offset exponential, x ranges from offset to offset+12*mean. */
+    const xMin = Math.max(1e-9, loEff);
+    const xMax = loEff + m * 12;
+    xs = linspace(xMin, xMax, N);
+    ys = xs.map(x => exppdf(x - loEff, m));
+    logScale = xMax / Math.max(xMin, 1e-9) > 5;
     xLabel = 'x';
+    offsetAt = loEff;
   } else if (p.kind === 'gamma') {
     /* BEAST X uses `shape` (alpha) and `scale` (theta); fall back to the
      * generic shape1/shape2 spellings for callers that prefer them.  An
@@ -206,24 +208,27 @@ function samplePrior(p, N = 200) {
     const xMax = Math.max(lo + 0.5, lo + k * th * 10);
     xs = linspace(Math.max(1e-5, lo), xMax, N);
     ys = xs.map(x => gammapdf(x - lo, k, th));
-    /* shape < 1 puts mass at zero with a long tail — always use log scale
-     * there.  shape >= 1 with a wide range also benefits from log scale. */
-    logScale = k < 1 || xMax > 5;
+    logScale = k < 1 || xMax / Math.max(lo, 1e-5) > 5;
     xLabel = 'x';
+    offsetAt = lo;
   } else if (p.kind === 'normal') {
     const m = isFinite(mu) ? mu : 0;
-    const s = isFinite(sigma) && sigma > 0 ? sigma : 1;
-    xs = linspace(m - 4 * s, m + 4 * s, N);
+    const s = (isFinite(sigma) && sigma > 0) ? sigma : 1;
+    const xMin = m - 4 * s, xMax = m + 4 * s;
+    xs = linspace(xMin, xMax, N);
     ys = xs.map(x => normalpdf(x, m, s));
     logScale = false;
     xLabel = 'x';
+    offsetAt = isFinite(offset) ? offset : null;
   } else if (p.kind === 'laplace') {
     const m = isFinite(mu) ? mu : 0;
-    const b = isFinite(sigma) && sigma > 0 ? sigma : 1;
-    xs = linspace(m - 6 * b, m + 6 * b, N);
+    const b = (isFinite(sigma) && sigma > 0) ? sigma : 1;
+    const xMin = m - 6 * b, xMax = m + 6 * b;
+    xs = linspace(xMin, xMax, N);
     ys = xs.map(x => laplacepdf(x, m, b));
     logScale = false;
     xLabel = 'x';
+    offsetAt = isFinite(offset) ? offset : null;
   } else if (p.kind === 'uniform') {
     const a = isFinite(lo) ? lo : 0;
     const b = isFinite(hi) ? hi : Math.max(a + 1, 1);
@@ -232,12 +237,18 @@ function samplePrior(p, N = 200) {
     logScale = false;
     xLabel = 'x';
   } else if (p.kind === 'beta') {
-    const a = isFinite(shape1) && shape1 > 0 ? shape1 : 1;
-    const b = isFinite(shape2) && shape2 > 0 ? shape2 : 1;
-    xs = linspace(1e-4, 1 - 1e-4, N);
-    ys = xs.map(x => betapdf(x, a, b));
+    /* BEAST X's beta prior uses shape1, shape2, plus an optional offset
+     * and scale that map [0, 1] -> [offset, offset+scale]. */
+    const a = isFinite(shape) && shape > 0 ? shape : 1;
+    const b = isFinite(scale) && scale > 0 ? scale : 1;
+    const off = isFinite(offset) ? offset : 0;
+    const sc  = isFinite(p.scale) ? Number(p.scale) : 1;
+    const loEff = off, hiEff = off + sc;
+    xs = linspace(loEff + 1e-4 * sc, hiEff - 1e-4 * sc, N);
+    ys = xs.map(x => betapdf((x - loEff) / sc, a, b) / sc);
     logScale = false;
     xLabel = 'x';
+    offsetAt = off;
   } else if (p.kind === 'oneOnX') {
     const xMin = 0.01, xMax = 10;
     xs = logspace(xMin, xMax, N);
@@ -253,7 +264,7 @@ function samplePrior(p, N = 200) {
   } else {
     return null;
   }
-  return { xs, ys, logScale, xLabel };
+  return { xs, ys, logScale, xLabel, offsetAt };
 }
 
 /* Render the density as an inline SVG string. */
@@ -261,25 +272,52 @@ export function priorPdfSvg(p, opts = {}) {
   const compact = !!opts.compact;
   const sample = samplePrior(p, compact ? 80 : 240);
   if (!sample) return '';
-  const { xs, ys, logScale, xLabel } = sample;
+  const { xs, ys, logScale, xLabel, offsetAt } = sample;
   const N = xs.length;
 
-  const W = compact ? 120 : 480;
-  const H = compact ? 36 : 240;
-  const M = compact ? 4 : 36;
+  /* Display dimensions: render at the prior dock content width (360 px
+   * dock width minus 12 px padding on each side minus 2 px border) so
+   * the SVG renders at native size and tick labels stay readable.
+   * Override via opts.width to fit other layouts. */
+  const W = compact ? 120 : (opts.width || 336);
+  /* Vertical layout: top margin (Mt), curve area, x-axis line, tick
+   * labels (~14 px below the line), gap, axis title, bottom margin.
+   * The total height is the curve area plus ~50 px of axis stack so
+   * the title does not collide with the tick labels. */
+  const H = compact ? 36 : Math.round(W * 0.62);
+  /* Left margin is wider than the right/top/bottom to give the
+   * rotated y-axis title ("density") its own lane, separated from
+   * the y-tick labels. */
+  const M = compact ? 4 : 22;
+  const Ml = compact ? 4 : 36;
+  const Mr = M, Mt = M;
+  /* Reserve enough bottom space for: tick labels (14 px), a 6-px gap,
+   * and the axis title (12 px ascent + 3 px descender) plus a 2-px
+   * safety margin. */
+  const Mb = 22 + 14 + 6 + 12 + 3 + 2;
+  /* Vertical layout constants for the x-axis stack: x-axis line at
+   * y = H - Mb, tick labels sit just below, axis title sits below the
+   * tick labels with a clear gap so the two don't collide. */
+  const tickBaselineDy = 14;     /* distance from axis line to tick label baseline */
+  const titleBaselineDy = Mb + 4; /* axis title baseline from bottom */
+  /* Tick and label font sizes scale with the SVG width so that the
+   * final on-screen text is roughly the same size regardless of how
+   * the SVG is laid out. */
+  const tickFs = compact ? 8 : 11;
+  const axisFs = compact ? 8 : 12;
+  const offsetFs = compact ? 7 : 10;
 
   let xsPlot;
   if (logScale) {
-    /* Log x-axis: convert to log, then linearly map. */
-    const lx = xs.map(x => Math.log(x));
+    const lx = xs.map(x => Math.log(Math.max(x, 1e-12)));
     const lxMin = lx[0], lxMax = lx[N - 1];
-    xsPlot = lx.map(v => M + (v - lxMin) / (lxMax - lxMin || 1e-9) * (W - 2 * M));
+    xsPlot = lx.map(v => Ml + (v - lxMin) / (lxMax - lxMin || 1e-9) * (W - Ml - Mr));
   } else {
     const xMin = xs[0], xMax = xs[N - 1];
-    xsPlot = xs.map(x => M + (x - xMin) / (xMax - xMin || 1e-9) * (W - 2 * M));
+    xsPlot = xs.map(x => Ml + (x - xMin) / (xMax - xMin || 1e-9) * (W - Ml - Mr));
   }
   const ymax = Math.max(...ys, 1e-12);
-  const sy = y => H - M - (y / ymax) * (H - 2 * M);
+  const sy = y => H - Mb - (y / ymax) * (H - Mt - Mb);
 
   let d = '';
   for (let i = 0; i < N; i++) {
@@ -288,17 +326,17 @@ export function priorPdfSvg(p, opts = {}) {
 
   if (compact) {
     return `<svg width="${W}" height="${H}" viewBox="0 0 ${W} ${H}" class="prior-pdf">
-      <line x1="${M}" y1="${H - M}" x2="${W - M}" y2="${H - M}"
+      <line x1="${Ml}" y1="${H - Mb}" x2="${W - Mr}" y2="${H - Mb}"
             stroke="currentColor" stroke-opacity="0.25" stroke-width="0.5"/>
       <path d="${d}" fill="none" stroke="currentColor" stroke-width="1.4"/></svg>`;
   }
 
-  /* Full plot: ticks, axis labels, and the curve. */
+  /* Full plot: ticks, axis labels, the curve, and the offset marker. */
   const ticks = 5;
   const xTickVals = logScale
     ? Array.from({ length: ticks + 1 }, (_, i) => {
-        const lxMin = Math.log(xs[0]);
-        const lxMax = Math.log(xs[N - 1]);
+        const lxMin = Math.log(Math.max(xs[0], 1e-12));
+        const lxMax = Math.log(Math.max(xs[N - 1], 1e-12));
         return Math.exp(lxMin + (i / ticks) * (lxMax - lxMin));
       })
     : Array.from({ length: ticks + 1 }, (_, i) =>
@@ -315,15 +353,14 @@ export function priorPdfSvg(p, opts = {}) {
   let xTickMarks = '';
   for (let i = 0; i < xTickVals.length; i++) {
     const v = xTickVals[i];
-    /* Compute the plot position the same way as xsPlot. */
     const px = logScale
-      ? M + (Math.log(v) - Math.log(xs[0])) /
-              (Math.log(xs[N - 1]) - Math.log(xs[0]) || 1e-9) * (W - 2 * M)
-      : M + (v - xs[0]) / (xs[N - 1] - xs[0] || 1e-9) * (W - 2 * M);
+      ? Ml + (Math.log(Math.max(v, 1e-12)) - Math.log(Math.max(xs[0], 1e-12))) /
+              (Math.log(Math.max(xs[N - 1], 1e-12)) - Math.log(Math.max(xs[0], 1e-12)) || 1e-9) * (W - Ml - Mr)
+      : Ml + (v - xs[0]) / (xs[N - 1] - xs[0] || 1e-9) * (W - Ml - Mr);
     const x = px.toFixed(2);
     xTickMarks +=
-      `<line x1="${x}" y1="${H - M}" x2="${x}" y2="${H - M + 4}" stroke="currentColor"/>` +
-      `<text x="${x}" y="${H - M + 18}" text-anchor="middle" font-size="10" ` +
+      `<line x1="${x}" y1="${H - Mb}" x2="${x}" y2="${H - Mb + 4}" stroke="currentColor"/>` +
+      `<text x="${x}" y="${H - Mb + 13}" text-anchor="middle" font-size="${tickFs}" ` +
       `fill="currentColor" opacity="0.7">${fmt(v)}</text>`;
   }
   let yTickMarks = '';
@@ -331,37 +368,58 @@ export function priorPdfSvg(p, opts = {}) {
     const v = yTickVals[i];
     const y = sy(v).toFixed(2);
     yTickMarks +=
-      `<line x1="${M - 4}" y1="${y}" x2="${M}" y2="${y}" stroke="currentColor"/>` +
-      `<text x="${M - 6}" y="${y}" text-anchor="end" dominant-baseline="middle" ` +
-      `font-size="10" fill="currentColor" opacity="0.7">${fmt(v)}</text>`;
+      `<line x1="${Ml - 4}" y1="${y}" x2="${Ml}" y2="${y}" stroke="currentColor"/>` +
+      `<text x="${Ml - 6}" y="${y}" text-anchor="end" dominant-baseline="middle" ` +
+      `font-size="${tickFs}" fill="currentColor" opacity="0.7">${fmt(v)}</text>`;
+  }
+
+  /* Offset marker.  Draws a dashed vertical line at the offset x position
+   * and a small label "offset" near the top, so the user can see what
+   * the offset field does to the plot.  Skipped for ctmcScale / oneOnX. */
+  let offsetMark = '';
+  if (offsetAt !== null && offsetAt !== undefined &&
+      isFinite(offsetAt) && p.kind !== 'ctmcScale' && p.kind !== 'oneOnX') {
+    const xMinR = xs[0], xMaxR = xs[N - 1];
+    const inRange = offsetAt >= xMinR && offsetAt <= xMaxR;
+    if (inRange) {
+      const px = logScale
+        ? Ml + (Math.log(Math.max(offsetAt, 1e-12)) - Math.log(Math.max(xMinR, 1e-12))) /
+                (Math.log(Math.max(xMaxR, 1e-12)) - Math.log(Math.max(xMinR, 1e-12)) || 1e-9) * (W - Ml - Mr)
+        : Ml + (offsetAt - xMinR) / (xMaxR - xMinR || 1e-9) * (W - Ml - Mr);
+      const x = px.toFixed(2);
+      offsetMark =
+        `<line x1="${x}" y1="${Mt}" x2="${x}" y2="${H - Mb}"
+              stroke="currentColor" stroke-opacity="0.4" stroke-dasharray="3 3" stroke-width="1"/>` +
+        `<text x="${x}" y="${Mt - 4}" text-anchor="middle" font-size="${offsetFs}"
+              fill="currentColor" opacity="0.7">offset = ${fmt(offsetAt)}</text>`;
+    }
   }
 
   return `<svg width="${W}" height="${H}" viewBox="0 0 ${W} ${H}" class="prior-pdf-full">
-    <line x1="${M}" y1="${M}" x2="${M}" y2="${H - M}" stroke="currentColor" stroke-width="1"/>
-    <line x1="${M}" y1="${H - M}" x2="${W - M}" y2="${H - M}" stroke="currentColor" stroke-width="1"/>
+    <line x1="${Ml}" y1="${Mt}" x2="${Ml}" y2="${H - Mb}" stroke="currentColor" stroke-width="1"/>
+    <line x1="${Ml}" y1="${H - Mb}" x2="${W - Mr}" y2="${H - Mb}" stroke="currentColor" stroke-width="1"/>
     ${xTickMarks}
     ${yTickMarks}
-    <text x="${W / 2}" y="${H - 4}" text-anchor="middle" font-size="11"
+    ${offsetMark}
+    <text x="${(Ml + W - Mr) / 2}" y="${H - 4}" text-anchor="middle" font-size="${axisFs}"
           fill="currentColor" opacity="0.85">${xLabel}${logScale ? '  (log scale)' : ''}</text>
-    <text x="12" y="${H / 2}" text-anchor="middle" font-size="11"
+    <text x="${axisFs / 2 + 1}" y="${(Mt + H - Mb) / 2}" text-anchor="middle" font-size="${axisFs}"
           fill="currentColor" opacity="0.85"
-          transform="rotate(-90 12 ${H / 2})">density</text>
+          transform="rotate(-90 ${axisFs / 2 + 1} ${(Mt + H - Mb) / 2})">density</text>
     <path d="${d}" fill="none" stroke="currentColor" stroke-width="1.6"/>
   </svg>`;
 }
 
 /* ------------------------------------------------------ XML editing helpers */
 
-/* We support two equivalent editing strategies and pick the simpler one for
- * the common case:
+/* Two equivalent editing strategies:
  *
  *  1. **Regex editing on the original text.**  When the user edits a value
- *     on a row, we know the tag (`gammaPrior`, `scaleOperator`, `mcmc`,
- *     etc.), the index of the matching element, and the attribute name.  We
- *     locate the matching opening tag and rewrite its attribute in place.
- *     This keeps the original XML formatting (indentation, comments,
- *     element ordering) intact, which matters because the source view
- *     still has to look right.
+ *     on a row, we know the tag, the index of the matching element, and
+ *     the attribute name.  We locate the matching opening tag and rewrite
+ *     its attribute in place.  This keeps the original XML formatting
+ *     (indentation, comments, element ordering) intact, which matters
+ *     because the source view still has to look right.
  *
  *  2. **DOM editing on a parsed document.**  Fallback for edits that need
  *     to add/remove attributes; used by setAttr.
@@ -370,9 +428,6 @@ export function priorPdfSvg(p, opts = {}) {
  * it preserves everything the user did not touch. */
 
 function buildElementIndex(text) {
-  /* Find every opening tag in the document and its byte offset, in source
-   * order.  Each entry is { tag, attrs: {name -> value}, start (offset of
-   * `<`), end (offset just past `>`), depth }. */
   const re = /<!--[\s\S]*?-->|<\?[\s\S]*?\?>|<(!\w[\s\S]*?|[A-Za-z_][\w.:-]*)([^>]*?)(\/?)>/g;
   const out = [];
   let depth = 0;
@@ -406,16 +461,10 @@ function parseAttrs(s) {
 }
 
 function serializeAttrs(attrs) {
-  /* Quote attribute values with double quotes.  Emit in the same order they
-   * were declared in, then any new ones alphabetically. */
   const keys = Object.keys(attrs);
   return keys.map(k => `${k}="${(attrs[k] || '').replace(/"/g, '&quot;')}"`).join(' ');
 }
 
-/* Find the i-th element in `text` whose tag matches `tagName` AND whose
- * idref (under <parameter>/<treeModel>) matches `targetId`.  Returns
- * { start, end, attrs, selfClose } or null.  Pass `targetId = null` to skip
- * the idref check (for elements that have no idref, e.g. <mcmc>). */
 function findElementByTagAndRef(text, tagName, targetId, i) {
   const idx = buildElementIndex(text);
   let n = 0;
@@ -429,11 +478,30 @@ function findElementByTagAndRef(text, tagName, targetId, i) {
   return null;
 }
 
+/* Convert a byte offset into a 1-based line number.  Used to jump
+ * from a MCMC sidebar row to the source view at the matching XML
+ * line.  Returns null if the offset is past the end of the text. */
+function offsetToLine(text, offset) {
+  if (offset < 0) return null;
+  let line = 1, col = 0;
+  for (let i = 0; i < text.length && i <= offset; i++) {
+    if (text[i] === '\n') { line++; col = 0; }
+    else col++;
+    if (i === offset) return line;
+  }
+  return line;
+}
+
+/* Find the line number of the i-th element of `tagName` whose body
+ * includes an idref to `targetId`.  Returns null if no such element
+ * exists.  Used to jump from the MCMC sidebar to the source view. */
+export function findElementLine(text, tagName, targetId, i) {
+  const found = findElementByTagAndRef(text, tagName, targetId, i);
+  return found ? offsetToLine(text, found.start) : null;
+}
+
 function elementReferencesId(elEntry, text, targetId) {
-  /* Walk the element body until matching close tag and check every idref. */
   const bodyStart = elEntry.end;
-  /* Naively search forward for </tagName> with the same depth.  Robust
-   * enough for well-formed BEAST X XML. */
   const closeRe = new RegExp(`</\\s*${elEntry.tag}\\s*>`, 'g');
   closeRe.lastIndex = bodyStart;
   const closeMatch = closeRe.exec(text);
@@ -448,28 +516,19 @@ function elementReferencesId(elEntry, text, targetId) {
   return false;
 }
 
-/* Rewrite an attribute on the i-th element of `tagName` (whose idref
- * descendants include `targetId`, if given).  Returns the new XML text.
- * If `targetId` is null, only matches by tag (used for <mcmc>). */
 export function setAttrOnElement(text, tagName, targetId, i, attrName, attrValue) {
   const found = findElementByTagAndRef(text, tagName, targetId, i);
   if (!found) return null;
   const tagSrc = text.slice(found.start, found.end);
-  /* Locate the attribute inside tagSrc. */
   const re = new RegExp(`\\b${attrName}\\s*=\\s*("([^"]*)"|'([^']*)')`);
   const m = re.exec(tagSrc);
   let newTag;
   if (m) {
     if (attrValue === null || attrValue === undefined || attrValue === '') {
-      /* Remove the attribute.  Strip a single adjacent space (before or
-       * after) so we don't leave two spaces next to the surrounding
-       * attributes. */
       let start = m.index, end = m.index + m[0].length;
       const before = start > 0 && /\s/.test(tagSrc[start - 1]);
       const after  = end < tagSrc.length && /\s/.test(tagSrc[end]);
       if (before && after) {
-        /* Prefer to drop the trailing space so the leading space stays as
-         * a separator from the previous attribute. */
         end++;
       } else if (after) {
         end++;
@@ -483,7 +542,6 @@ export function setAttrOnElement(text, tagName, targetId, i, attrName, attrValue
         tagSrc.slice(m.index + m[0].length);
     }
   } else {
-    /* Add a new attribute before the closing `>` or `/>`. */
     if (attrValue === null || attrValue === undefined || attrValue === '') return text;
     const insertRe = /(\s*\/?>)$/;
     const insertMatch = insertRe.exec(tagSrc);
@@ -496,8 +554,6 @@ export function setAttrOnElement(text, tagName, targetId, i, attrName, attrValue
   return text.slice(0, found.start) + newTag + text.slice(found.end);
 }
 
-/* Set an attribute on every element of `tagName` whose depth/identity makes
- * sense (e.g. all <log> and <logTree>).  Returns the updated text. */
 export function setAttrOnAll(text, tagName, attrName, attrValue) {
   const re = new RegExp(`(<\s*${tagName}\\b)([^>]*?)(/?>)`, 'g');
   return text.replace(re, (full, head, body, tail) => {
@@ -522,13 +578,7 @@ export function serializeXml(doc) {
   return new XMLSerializer().serializeToString(doc);
 }
 
-/* Backwards-compat: the DOM helpers below are kept for callers that need
- * to manipulate elements in a parsed doc.  The editor itself uses the
- * text-based helpers above so the source view remains intact. */
-
-/* DOM-based helpers retained for callers that prefer a parsed document.  The
- * editor itself uses the text-based helpers above so the source view remains
- * byte-identical. */
+/* DOM-based helpers retained for callers that prefer a parsed document. */
 export function findPrior(doc, distName, targetId, i) {
   const all = [...doc.getElementsByTagName(distName)];
   let n = 0;
@@ -558,8 +608,6 @@ function elementReferences(doc, el, targetId) {
   return false;
 }
 
-/* Read all attributes of a prior/operator element (skipping idref) and
- * return a flat object suitable for priorPdfSvg / re-rendering. */
 export function readPriorAttrsFromDoc(doc, distName, targetId, i) {
   const el = findPrior(doc, distName, targetId, i);
   if (!el) return null;
@@ -571,10 +619,6 @@ export function readPriorAttrsFromDoc(doc, distName, targetId, i) {
   return out;
 }
 
-/* Apply an attribute edit to the matching prior/operator element on the
- * text.  Returns the new text, or null if no match was found.  We keep the
- * old DOM-based helper around (findPrior / findOperator) but the editor
- * uses these so the source view remains byte-identical. */
 export function applyPriorEdit(text, distName, targetId, index, key, value) {
   return setAttrOnElement(text, distName, targetId, index, key, value);
 }
@@ -588,205 +632,27 @@ export function applyLogEdit(text, kind, key, value) {
   return setAttrOnAll(text, kind, key, value);
 }
 
-/* ----------------------------------------------------------- editor UI */
+/* --------------------------------------------------------- prior collection */
 
-/* Build a config for a single prior row, by inspecting the i-th prior element
- * with `dist` on `targetId`.  (DOM helper, currently unused by the editor —
- * retained for callers that prefer the parsed-document API.) */
-function priorFromElement(el) {
-  const out = { kind: el.tagName.replace(/Prior$/, '') };
-  for (const a of el.attributes) {
-    if (a.name === 'idref') continue;
-    out[a.name] = a.value;
-  }
-  return out;
-}
-function operatorFromElement(el) {
-  const out = { kind: el.tagName };
-  for (const a of el.attributes) {
-    out[a.name] = a.value;
-  }
-  return out;
-}
-
-/* Render the editor into `root`.  Pass the parsed model (for picking priors
- * and operators to edit) and the original XML text (so we can mutate and
- * re-serialise).
- *
- * Callbacks:
- *  - onApply(updatedXml) — user committed an edit; parse & re-render
- *  - onClose() — user dismissed the editor
- */
-export class McmcEditor {
-  constructor(rootEl, opts = {}) {
-    this.root = rootEl;
-    this.onApply = opts.onApply || (() => {});
-    this.onClose = opts.onClose || (() => {});
-    this.model = null;
-    this.xmlText = null;
-    this.doc = null;
-  }
-
-  open(model, xmlText) {
-    this.model = model;
-    this.xmlText = xmlText;
-    this.doc = parseXml(xmlText);
-    this.render();
-  }
-
-  render() {
-    const m = this.model;
-    const priors = collectPriors(m);
-    const operators = collectOperators(m);
-    const mcmc = readMcmcAttrs(this.doc);
-    const logs = readLogAttrs(this.doc);
-
-    /* Preserve the currently-selected prior across re-renders (e.g. after
-     * the user adds an attribute and the editor rebuilds).  Falls back to
-     * the first prior, or null if there are none. */
-    const sel = this.selectedPrior || (priors[0] && priors[0].key) || null;
-
-    this.root.innerHTML = `
-      <div class="mcmc-editor">
-        <div class="me-head">
-          <h2>Edit priors &amp; MCMC</h2>
-          <div class="me-spacer"></div>
-          <button class="me-export">Export XML</button>
-          <button class="me-close" aria-label="Close">&times;</button>
-        </div>
-        <div class="me-body">
-          ${priors.length ? previewPane(priors, sel) :
-            '<div class="hint">No priors in this model \u2014 nothing to preview.</div>'}
-          <section>
-            <h3>Priors <span class="me-count">${priors.length}</span></h3>
-            ${priors.length ? '' : '<div class="hint">No priors in this model.</div>'}
-            ${priors.map(p => priorRow(p, p.key === sel)).join('')}
-          </section>
-
-          <section>
-            <h3>Operators <span class="me-count">${operators.length}</span></h3>
-            ${operators.length ? '' : '<div class="hint">No operators in this model.</div>'}
-            ${operators.map((op, i) => operatorRow(op, i)).join('')}
-          </section>
-
-          <section>
-            <h3>MCMC</h3>
-            ${mcmc.length ? mcmcRow(mcmc) : '<div class="hint">No <code>&lt;mcmc&gt;</code> element found.</div>'}
-            ${logs.length ? logsRow(logs) : ''}
-          </section>
-        </div>
-      </div>`;
-
-    this.root.querySelector('.me-close').onclick = () => this.onClose();
-    this.root.querySelector('.me-export').onclick = () => this.exportXml();
-    wirePriorRows(this, this.root);
-    wireOperatorRows(this, this.root);
-    wireMcmcRows(this, this.root);
-    wirePreviewPane(this, this.root);
-    if (sel) this.refreshPreview(sel);
-  }
-
-  /* Set the currently-previewed prior.  Called by the dropdown, by input
-   * focus events, and internally on initial render. */
-  selectPrior(key) {
-    if (this.selectedPrior === key) {
-      this.refreshPreview(key);
-      return;
-    }
-    this.selectedPrior = key;
-    /* Mark the row that holds this prior as selected so the user can see
-     * which row is being previewed. */
-    for (const r of this.root.querySelectorAll('[data-pri-row]')) {
-      r.classList.toggle('selected', r.dataset.priKey === key);
-    }
-    /* Sync the dropdown. */
-    const dd = this.root.querySelector('#pri-select');
-    if (dd && dd.value !== key) dd.value = key;
-    this.refreshPreview(key);
-  }
-
-  /* Re-render the preview graph for `key` using its current XML values
-   * layered with any pending input values that the user is typing. */
-  refreshPreview(key) {
-    const plot = this.root.querySelector('#pri-preview');
-    const desc = this.root.querySelector('#pri-desc');
-    if (!plot) return;
-    const p = findPriorByKey(this.model, key);
-    if (!p) {
-      plot.innerHTML = '';
-      if (desc) desc.textContent = '';
-      return;
-    }
-    /* Build the values object for the PDF.  We always include `kind` so
-     * `samplePrior` can pick the right branch even when the doc lookup
-     * returns null.  Pending values (the in-progress edit) layer on top
-     * of the committed values. */
-    const kind = p.dist.replace(/Prior$/, '');
-    const base = readPriorAttrsFromDoc(this.doc, p.dist, p.targetId, p.index);
-    const pending = this.pendingInputs && this.pendingInputs[key];
-    const vals = Object.assign(
-      { kind },
-      base || {},
-      pending || {});
-    plot.innerHTML = priorPdfSvg(vals);
-    if (desc) {
-      const info = PRIOR_INFO[kind] || { text: '' };
-      desc.textContent = info.text || '';
-    }
-  }
-
-  /* Download the current (edited) XML as a file. */
-  exportXml() {
-    const blob = new Blob([this.xmlText], { type: 'application/xml' });
-    const a = document.createElement('a');
-    a.href = URL.createObjectURL(blob);
-    a.download = 'edited.xml';
-    a.click();
-    URL.revokeObjectURL(a.href);
-  }
-
-  /* Apply a mutation: rewrite the XML text in place, re-parse so the next
-   * render reflects fresh values, then ask the parent to refresh the
-   * viewer.  We keep the source view's formatting by editing the text
-   * directly rather than re-serialising the DOM.  Returns the new XML
-   * text on success, `null` if the mutator could not find its target
-   * (e.g. the attribute did not exist on the prior element). */
-  commit(mutator) {
-    const next = mutator(this.xmlText);
-    if (next == null) return null;
-    this.xmlText = next;
-    try {
-      this.doc = parseXml(next);
-    } catch (e) {
-      /* If the user's edit broke the XML, leave the text as-is but skip the
-       * viewer re-render so the source view shows what they typed. */
-      this.onApply(next, e);
-      return null;
-    }
-    this.onApply(next, null);
-    return next;
-  }
-}
-
+/* Build a list of priors exposed by the model.  Each entry is the
+ * minimal info needed by PriorDock and McmcEditor: {key, dist,
+ * targetId, attrs, index, label}.  The (targetId, dist) pair is the
+ * natural key; we number occurrences of the same pair so setAttr
+ * can find the i-th element of that kind. */
 function collectPriors(model) {
-  /* The parser exposes one entry per (targetId, prior-dist) pair.  We
-   * give every prior a stable key (used by the preview pane to identify
-   * which row's curve to draw) and dedupe so each (target, dist) pair
-   * appears exactly once. */
   const out = [];
-  const seen = new Set();
-  let n = 0;
+  const seen = new Map();
   for (const node of model.nodes) {
     for (const p of node.priors || []) {
       const k = p.dist + ':' + node.id;
-      if (seen.has(k)) continue;
-      seen.add(k);
+      const i = seen.get(k) || 0;
+      seen.set(k, i + 1);
       out.push({
-        key: `pri-${n++}`,
+        key: `pri-${node.id}-${p.dist}-${i}`,
         dist: p.dist,
         targetId: node.id,
         attrs: p.attrs,
-        index: 0,
+        index: i,
         label: p.label || node.id,
       });
     }
@@ -801,23 +667,35 @@ function findPriorByKey(model, key) {
   return null;
 }
 
+/* Find a prior entry by its target node id and the prior's dist tag.
+ * Returns the first match; mostly used to look up priors when the
+ * user clicks a parameter or hyperparameter node in the diagram. */
+function findPriorByTarget(model, targetId) {
+  const priors = collectPriors(model);
+  return priors.filter(p => p.targetId === targetId);
+}
+
 function collectOperators(model) {
   const out = [];
-  const seen = new Set();
+  /* Count i-th occurrence of each (tag, target) pair so the McmcEditor
+   * can pass the right index to setAttrOnElement / findElementLine. */
+  const seen = new Map();
   for (const n of model.nodes) {
     for (const o of n.operators || []) {
       const k = o.tag + ':' + n.id;
-      if (seen.has(k)) continue;
-      seen.add(k);
+      const i = seen.get(k) || 0;
+      seen.set(k, i + 1);
       out.push({
         tag: o.tag,
         targetId: n.id,
         attrs: o.attrs,
-        index: 0,
+        index: i,
         label: n.id,
       });
     }
   }
+  /* Index each operator by its (tag, target, index) tuple so the
+   * McmcEditor can look it up when wiring a click-to-jump. */
   return out;
 }
 
@@ -840,19 +718,27 @@ function readLogAttrs(doc) {
   return out;
 }
 
-/* ----------------------------------------------- row renderers */
+/* ------------------------------------------------------- shared form helpers */
+
+const esc = s => String(s).replace(/[&<>"']/g, c =>
+  ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+
+/* Escape a string for use as a CSS attribute-selector value. */
+const cssEscape = (s) => {
+  if (typeof CSS !== 'undefined' && CSS.escape) return CSS.escape(s);
+  return String(s).replace(/["\\]/g, '\\$&');
+};
 
 function attrInputs(spec, values, ns) {
-  /* spec: [{key, label, type}].  Returns HTML for the labeled inputs and the
-   * data-pri / data-op / data-mcmc / data-log attributes the wirer uses. */
   return spec.map(({ key, label, type }) => {
     const v = values[key] != null ? values[key] : '';
     const safe = esc(String(v));
     if (type === 'select') {
+      const opt = spec.find(s => s.key === key);
       return `<label>${label}</label>
         <select data-${ns}="" data-key="${key}">
-          ${spec.find(s => s.key === key).options.map(opt =>
-            `<option value="${esc(opt)}" ${String(v) === opt ? 'selected' : ''}>${esc(opt)}</option>`
+          ${opt.options.map(o =>
+            `<option value="${esc(o)}" ${String(v) === o ? 'selected' : ''}>${esc(o)}</option>`
           ).join('')}
         </select>`;
     }
@@ -861,83 +747,38 @@ function attrInputs(spec, values, ns) {
   }).join('');
 }
 
-function priorRow(p, isSelected) {
-  const distKind = p.dist.replace(/Prior$/, '');
-  const vals = { ...p.attrs };
-  const isCtmc = distKind === 'ctmcScale';
-  const info = PRIOR_INFO[distKind] || { label: distKind, text: '' };
-  /* The editor exposes the common attributes.  ctmcScale has nothing. */
-  const spec = isCtmc ? [] : priorFields(distKind, vals);
-  return `
-    <div class="slot ${isSelected ? 'selected' : ''}" data-pri-row="0"
-         data-pri-key="${esc(p.key)}" data-dist="${esc(p.dist)}"
-         data-target="${esc(p.targetId)}" data-pri-index="${p.index}">
-      <div class="slot-head">
-        <strong>${esc(info.label)}</strong>
-        <code class="slot-target">${esc(p.targetId)}</code>
-      </div>
-      <details class="slot-edit" open>
-        <summary>Edit parameters</summary>
-        ${spec.length ? attrInputs(spec, vals, 'pri') : '<div class="hint">No editable parameters.</div>'}
-      </details>
-    </div>`;
-}
-
-/* Render the persistent preview pane at the top of the editor.  A dropdown
- * lists every prior; the selected prior's density curve is drawn full-size
- * with axes below.  Focus events on any prior input auto-switch the
- * selection so the preview follows the user's attention. */
-function previewPane(priors, selectedKey) {
-  return `
-    <section class="me-preview">
-      <div class="me-preview-bar">
-        <label>Preview:</label>
-        <select id="pri-select">
-          ${priors.map(p =>
-            `<option value="${esc(p.key)}" ${p.key === selectedKey ? 'selected' : ''}>` +
-            `${esc((PRIOR_INFO[p.dist.replace(/Prior$/, '')] || { label: p.dist }).label)}` +
-            ` on <code>${esc(p.targetId)}</code></option>`
-          ).join('')}
-        </select>
-      </div>
-      <div class="me-preview-plot" id="pri-preview"></div>
-      <p class="me-preview-desc" id="pri-desc"></p>
-    </section>`;
-}
-
-/* The set of editable attributes for each prior kind.  We pick a sensible
- * subset of the BEAST X attribute set; advanced/uncommon fields stay in the
- * source XML. */
-function priorFields(kind, vals) {
+function priorFields(kind) {
   switch (kind) {
     case 'logNormal':
       return [
         { key: 'mean', label: 'mean (\u03BC of log)', type: 'text' },
         { key: 'stdev', label: 'stdev (\u03C3 of log)', type: 'text' },
-        { key: 'offset', label: 'offset', type: 'text' },
+        { key: 'offset', label: 'offset (shifts support right)', type: 'text' },
         { key: 'meanInRealSpace', label: 'meanInRealSpace', type: 'select',
           options: ['false', 'true'] },
       ];
     case 'exponential':
       return [
         { key: 'mean', label: 'mean', type: 'text' },
-        { key: 'offset', label: 'offset', type: 'text' },
+        { key: 'offset', label: 'offset (shifts support right)', type: 'text' },
       ];
     case 'gamma':
       return [
         { key: 'shape', label: 'shape (\u03B1)', type: 'text' },
         { key: 'scale', label: 'scale (\u03B8)', type: 'text' },
-        { key: 'offset', label: 'offset', type: 'text' },
+        { key: 'offset', label: 'offset (shifts support right)', type: 'text' },
       ];
     case 'normal':
       return [
         { key: 'mean', label: 'mean', type: 'text' },
         { key: 'stdev', label: 'stdev', type: 'text' },
+        { key: 'offset', label: 'offset (shifts support)', type: 'text' },
       ];
     case 'laplace':
       return [
         { key: 'mean', label: 'mean', type: 'text' },
         { key: 'scale', label: 'scale', type: 'text' },
+        { key: 'offset', label: 'offset (shifts support)', type: 'text' },
       ];
     case 'uniform':
       return [
@@ -948,8 +789,8 @@ function priorFields(kind, vals) {
       return [
         { key: 'shape1', label: 'shape1 (\u03B1)', type: 'text' },
         { key: 'shape2', label: 'shape2 (\u03B2)', type: 'text' },
-        { key: 'offset', label: 'offset', type: 'text' },
-        { key: 'scale', label: 'scale', type: 'text' },
+        { key: 'offset', label: 'offset (start of support)', type: 'text' },
+        { key: 'scale', label: 'scale (length of support)', type: 'text' },
       ];
     case 'oneOnX':
       return [];
@@ -958,33 +799,9 @@ function priorFields(kind, vals) {
   }
 }
 
-function operatorRow(op, i) {
-  const tag = op.tag;
-  const vals = { ...op.attrs };
-  const spec = operatorFields(tag);
-  return `
-    <div class="slot" data-op-row="${i}" data-tag="${esc(tag)}"
-         data-target="${esc(op.targetId)}">
-      <div class="slot-head">
-        <strong>${esc(tag)}</strong>
-        <code class="slot-target">${esc(op.targetId)}</code>
-      </div>
-      <details class="slot-edit" open>
-        <summary>Edit parameters</summary>
-        ${spec.length ? attrInputs(spec, vals, 'op') : '<div class="hint">No editable parameters.</div>'}
-      </details>
-    </div>`;
-}
-
-function operatorFields(tag) {
-  /* Most operators share {weight, scaleFactor}.  Tree operators use
-   * {size, gaussian} etc; we expose the common ones plus anything present
-   * in the source so the user can edit back without losing context. */
-  const common = [
+function operatorFields() {
+  return [
     { key: 'weight', label: 'weight', type: 'number' },
-  ];
-  const sized = [
-    ...common,
     { key: 'scaleFactor', label: 'scaleFactor', type: 'number' },
     { key: 'size', label: 'size', type: 'text' },
     { key: 'windowSize', label: 'windowSize', type: 'text' },
@@ -994,156 +811,583 @@ function operatorFields(tag) {
     { key: 'type', label: 'type (nodeHeightOperator)', type: 'text' },
     { key: 'boundaryCondition', label: 'boundaryCondition', type: 'text' },
   ];
-  return sized;
 }
 
-function mcmcRow(attrs) {
-  const obj = Object.fromEntries(attrs);
-  const spec = [
-    { key: 'chainLength', label: 'chainLength', type: 'number' },
-    { key: 'autoOptimize', label: 'autoOptimize', type: 'select', options: ['true', 'false'] },
-    { key: 'preBurnin', label: 'preBurnin', type: 'number' },
-  ];
-  return `<div class="slot" data-mcmc-row="">
-    <div class="slot-head"><strong>&lt;mcmc&gt;</strong></div>
-    <details class="slot-edit" open>
-      <summary>Edit MCMC parameters</summary>
-      ${attrInputs(spec, obj, 'mcmc')}
-    </details>
-  </div>`;
-}
+/* ----------------------------------------------------- PriorDock (right panel) */
 
-function logsRow(logs) {
-  return logs.map((lg, i) => `
-    <div class="slot" data-log-row="${i}" data-kind="${esc(lg.kind)}">
-      <div class="slot-head"><strong>&lt;${esc(lg.kind)}&gt;</strong></div>
-      <details class="slot-edit">
-        <summary>Edit log every</summary>
-        <label>logEvery</label>
-        <input type="number" data-log="" data-key="logEvery"
-               value="${esc(lg.logEvery || '')}">
-        ${lg.fileName ? `<label>fileName</label>
-          <input type="text" data-log="" data-key="fileName"
-                 value="${esc(lg.fileName)}">` : ''}
-      </details>
-    </div>`).join('');
-}
+/* The right-docked prior editor.  Renders a single prior at a time: a
+ * live density preview on the left, the editable attribute form on the
+ * right.  Both halves share one vertical scroll container so they
+ * never separate. */
+export class PriorDock {
+  constructor(rootEl, opts = {}) {
+    this.root = rootEl;
+    this.body = rootEl.querySelector('.prior-dock-body');
+    this.closeBtn = rootEl.querySelector('.prior-dock-close');
+    this.title = rootEl.querySelector('.prior-dock-title');
+    this.onApply = opts.onApply || (() => {});
+    this.onEditError = opts.onEditError || (() => {});
+    this.onClose = opts.onClose || (() => {});
+    this.model = null;
+    this.xmlText = null;
+    this.doc = null;
+    this.prior = null;
+    this.pendingInputs = {};
+    this.closeBtn.onclick = () => this.close();
+  }
 
-/* ----------------------------------------------- row wirers */
+  open(model, xmlText, prior) {
+    this.model = model;
+    this.xmlText = xmlText;
+    this.doc = parseXml(xmlText);
+    this.prior = prior;
+    this.pendingInputs = {};
+    this.root.hidden = false;
+    this.title.textContent = `Prior: ${prior.dist.replace(/Prior$/, '')}`;
+    this.render();
+  }
 
-function wirePriorRows(editor, root) {
-  /* The preview graph lives in a single pane at the top of the editor.
-   * Every prior input listens for:
-   *   - `focus` / `click`: switch the preview to this prior.
-   *   - `input`: cache the in-progress value and redraw the preview.
-   *   - `change`: commit the edit to the XML.
-   *   - `keydown` Enter: blur the input so `change` fires.
-   *
-   * The change event fires on blur for text/number inputs and
-   * immediately on `<select>` change.  We commit on each change so the
-   * preview is always backed by the freshly-parsed XML; the in-progress
-   * pending map only lives between an `input` and the next `change`.
-   */
-  editor.pendingInputs = editor.pendingInputs || {};
+  /* Update the model and XML text from the outside (e.g. after the
+   * MCMC editor commits an operator change).  We do not re-render the
+   * dock here: a full re-render would steal focus from the input the
+   * user is typing in.  The dock keeps its current prior and form
+   * values, and subsequent commits will read the fresh model. */
+  sync(model, xmlText) {
+    this.model = model;
+    this.xmlText = xmlText;
+    try {
+      this.doc = parseXml(xmlText);
+    } catch { /* leave stale doc; the next commit will surface the error */ }
+  }
 
-  for (const row of root.querySelectorAll('[data-pri-row]')) {
-    const key = row.dataset.priKey;
-    const dist = row.dataset.dist;
-    const target = row.dataset.target;
-    const idx = +row.dataset.priIndex;
-    const inputs = row.querySelectorAll('[data-pri]');
+  close() {
+    this.root.hidden = true;
+    this.prior = null;
+    this.pendingInputs = {};
+    this.onClose();
+  }
 
-    inputs.forEach(inp => {
-      const focus = () => editor.selectPrior(key);
-      inp.addEventListener('focus', focus);
-      inp.addEventListener('click', focus);
+  render() {
+    if (!this.body) return;
+    const p = this.prior;
+    if (!p) return;
+    const distKind = p.dist.replace(/Prior$/, '');
+    const info = PRIOR_INFO[distKind] || { label: distKind, text: '' };
+    const isCtmc = distKind === 'ctmcScale';
+    const spec = isCtmc ? [] : priorFields(distKind);
 
-      const commit = () => {
-        const result = editor.commit(xml =>
-          applyPriorEdit(xml, dist, target, idx, inp.dataset.key, inp.value));
-        if (result === null && inp.value !== '') {
-          /* applyPriorEdit returns null when the target element is not
-           * found.  Surface the failure so the user knows the edit did
-           * not land, instead of silently no-op'ing. */
-          if (editor.onEditError) editor.onEditError(
-            `${dist} on ${target}: attribute "${inp.dataset.key}" was not applied`);
-        }
-        if (editor.pendingInputs[key]) {
-          delete editor.pendingInputs[key][inp.dataset.key];
-        }
+    /* Header.  The dist name, the target parameter id, and a small
+     * link to swap to the next prior on the same target. */
+    const siblings = findPriorByTarget(this.model, p.targetId);
+    const idx = siblings.findIndex(s => s.key === p.key);
+    const hasPrev = idx > 0;
+    const hasNext = idx >= 0 && idx < siblings.length - 1;
+
+    this.body.innerHTML = `
+      <div class="pd-head">
+        <div class="pd-head-row">
+          <strong>${esc(info.label)}</strong>
+          <code class="pd-target">${esc(p.targetId)}</code>
+        </div>
+        <div class="pd-head-row pd-siblings">
+          <button class="pd-sib" data-dir="-1" ${hasPrev ? '' : 'disabled'}>&larr; previous prior</button>
+          <span class="pd-sib-count">${idx + 1} / ${siblings.length}</span>
+          <button class="pd-sib" data-dir="1" ${hasNext ? '' : 'disabled'}>next prior &rarr;</button>
+        </div>
+        <p class="pd-info">${esc(info.text || '')}</p>
+      </div>
+      <div class="pd-stack">
+        <div class="pd-preview">
+          <div class="pd-preview-plot" id="pd-plot"></div>
+        </div>
+        <div class="pd-form">
+          ${spec.length ? attrInputs(spec, p.attrs, 'pd') :
+            '<div class="hint">No editable parameters on this prior.</div>'}
+        </div>
+      </div>`;
+
+    this.body.querySelectorAll('.pd-sib').forEach(b => {
+      b.onclick = () => {
+        const dir = +b.dataset.dir;
+        const newIdx = idx + dir;
+        if (newIdx < 0 || newIdx >= siblings.length) return;
+        this.pendingInputs = {};
+        this.prior = siblings[newIdx];
+        this.render();
       };
+    });
 
-      /* Per-input debounced commit.  Each input has its own timer so
-       * rapid edits across multiple fields do not collide. */
-      let commitTimer = null;
+    this.refreshPlot();
+    this.wireForm();
+  }
+
+  refreshPlot() {
+    const plot = this.body.querySelector('#pd-plot');
+    if (!plot || !this.prior) return;
+    const p = this.prior;
+    const kind = p.dist.replace(/Prior$/, '');
+    const base = readPriorAttrsFromDoc(this.doc, p.dist, p.targetId, p.index);
+    const pending = this.pendingInputs || {};
+    const vals = Object.assign({ kind }, base || {}, pending);
+    plot.innerHTML = priorPdfSvg(vals);
+  }
+
+  wireForm() {
+    const inputs = this.body.querySelectorAll('[data-pd]');
+    const p = this.prior;
+    inputs.forEach(inp => {
+      const commit = () => {
+        const result = this.commit(xml =>
+          applyPriorEdit(xml, p.dist, p.targetId, p.index, inp.dataset.key, inp.value));
+        if (result === null && inp.value !== '') {
+          this.onEditError(
+            `${p.dist} on ${p.targetId}: attribute "${inp.dataset.key}" was not applied`);
+        }
+        if (this.pendingInputs[inp.dataset.key]) {
+          delete this.pendingInputs[inp.dataset.key];
+        }
+        /* Refresh the plot now that the in-progress value is committed
+         * and pending state is cleared.  The plot is built from base
+         * attrs (now from the freshly parsed XML) plus any remaining
+         * pending inputs. */
+        this.refreshPlot();
+      };
+      let timer = null;
       inp.addEventListener('input', () => {
-        editor.pendingInputs[key] = editor.pendingInputs[key] || {};
-        editor.pendingInputs[key][inp.dataset.key] = inp.value;
-        editor.selectPrior(key);
-        /* Debounced auto-commit: even if the user never blurs the
-         * input (e.g. clicks on the preview graph or the next field
-         * without an explicit blur in some browsers), the edit lands
-         * in the XML after ~600ms of idle typing. */
-        if (commitTimer) clearTimeout(commitTimer);
-        commitTimer = setTimeout(() => {
-          commitTimer = null;
-          commit();
-        }, 600);
+        this.pendingInputs[inp.dataset.key] = inp.value;
+        this.refreshPlot();
+        if (timer) clearTimeout(timer);
+        timer = setTimeout(() => { timer = null; commit(); }, 600);
       });
       inp.addEventListener('change', commit);
-      /* Pressing Enter inside a text/number input normally doesn't fire
-       * change unless we blur first.  Some browser/keyboard combos
-       * don't dispatch the change event reliably, so we commit
-       * explicitly on Enter. */
       inp.addEventListener('keydown', e => {
         if (e.key === 'Enter') {
           e.preventDefault();
-          if (commitTimer) { clearTimeout(commitTimer); commitTimer = null; }
+          if (timer) { clearTimeout(timer); timer = null; }
           commit();
           inp.blur();
         }
       });
     });
   }
+
+  commit(mutator) {
+    const next = mutator(this.xmlText);
+    if (next == null) return null;
+    this.xmlText = next;
+    try {
+      this.doc = parseXml(next);
+    } catch (e) {
+      this.onApply(next, e, /*stayOnDock=*/true);
+      return null;
+    }
+    this.onApply(next, null, /*stayOnDock=*/true);
+    return next;
+  }
 }
 
-function wirePreviewPane(editor, root) {
-  /* The dropdown above the preview switches the active prior. */
-  const dd = root.querySelector('#pri-select');
-  if (dd) dd.addEventListener('change', () => editor.selectPrior(dd.value));
-}
+/* ---------------------------------------------------------- McmcEditor (tab) */
 
-function wireOperatorRows(editor, root) {
-  for (const row of root.querySelectorAll('[data-op-row]')) {
-    const i = +row.dataset.opRow;
-    const tag = row.dataset.tag;
-    const target = row.dataset.target;
-    row.querySelectorAll('[data-op]').forEach(inp => {
-      inp.addEventListener('change', () => {
-        editor.commit(xml =>
-          applyOperatorEdit(xml, tag, target, i, inp.dataset.key, inp.value));
+/* The Edit MCMC tab content.  Lists every operator and exposes the
+ * <mcmc> / <log> / <logTree> rows for editing.  Priors are not
+ * here \u2014 they live in the right-docked PriorDock and are
+ * opened by clicking the corresponding prior or parameter node in
+ * the diagram. */
+export class McmcEditor {
+  constructor(rootEl, opts = {}) {
+    this.root = rootEl;
+    this.onApply = opts.onApply || (() => {});
+    this.onEditError = opts.onEditError || (() => {});
+    /* onJumpToLine(line) is invoked when the user clicks an operator
+     * row or a prior row in the sidebar.  The host (app.js) is
+     * responsible for switching to the source tab and scrolling the
+     * source view to that line. */
+    this.onJumpToLine = opts.onJumpToLine || (() => {});
+    this.model = null;
+    this.xmlText = null;
+    this.doc = null;
+    this.selectedPrior = null;
+    this.priorPreviewValues = {};
+    /* The currently "active" row in the sidebar, used to draw the
+     * orange highlight bar.  The bar is independent of source-line
+     * highlighting; it just shows which row the user last clicked or
+     * edited.  Format: "pri:<key>", "op:<rowIndex>", "mcmc", or
+     * "log:<rowIndex>". */
+    this.selectedRowKey = null;
+  }
+
+  open(model, xmlText) {
+    this.model = model;
+    this.xmlText = xmlText;
+    this.doc = parseXml(xmlText);
+    this.render();
+  }
+
+  /* Update the model and XML text from the outside.  We deliberately do
+   * not re-render here: a full re-render would steal focus from the
+   * input the user is typing in.  Subsequent commits will read the
+   * fresh model when the user blurs or presses Enter, so the existing
+   * form values stay correct as long as the user only edits attributes
+   * that already exist on the rows we built. */
+  sync(model, xmlText) {
+    this.model = model;
+    this.xmlText = xmlText;
+    try {
+      this.doc = parseXml(xmlText);
+    } catch { /* leave stale doc; the next commit will surface the error */ }
+  }
+
+  render() {
+    if (!this.root) return;
+    const m = this.model;
+    const priors = collectPriors(m);
+    const operators = collectOperators(m);
+    const mcmc = readMcmcAttrs(this.doc);
+    const logs = readLogAttrs(this.doc);
+
+    /* Keep the previously selected prior (if any) after a re-render;
+     * fall back to the first prior that has editable form fields, so
+     * the preview has something meaningful to show. */
+    if (!priors.find(p => p.key === this.selectedPrior)) {
+      const withFields = priors.find(p => priorFields(p.dist.replace(/Prior$/, '')).length);
+      this.selectedPrior = withFields ? withFields.key :
+                            (priors[0] ? priors[0].key : null);
+    }
+
+    this.root.innerHTML = `
+      <div class="mcmc-pane-head">
+        <h2>Edit MCMC</h2>
+        <p class="mcmc-pane-sub">
+          Edit priors, operators, and chain settings.  Click a row to
+          jump to it in the source XML on the left.  Edits update the
+          XML as you type.
+        </p>
+      </div>
+
+      <div class="mcmc-prior-preview" id="mcmc-prior-preview"></div>
+
+      <section>
+        <h3>Priors <span class="me-count">${priors.length}</span></h3>
+        ${priors.length ? '' :
+          '<div class="hint">No priors declared.</div>'}
+        ${priors.map(p => this.priorRow(p, p.key === this.selectedPrior)).join('')}
+      </section>
+
+      <section>
+        <h3>Operators <span class="me-count">${operators.length}</span></h3>
+        ${operators.length ? '' :
+          '<div class="hint">No operators in this model.</div>'}
+        ${operators.map((op, i) => this.operatorRow(op, i)).join('')}
+      </section>
+
+      <section>
+        <h3>MCMC</h3>
+        ${mcmc.length ? this.mcmcRow(mcmc) :
+          '<div class="hint">No <code>&lt;mcmc&gt;</code> element found.</div>'}
+      </section>
+
+      <section>
+        <h3>Log &amp; log tree <span class="me-count">${logs.length}</span></h3>
+        ${logs.length ? logs.map((lg, i) => this.logRow(lg, i)).join('') :
+          '<div class="hint">No <code>&lt;log&gt;</code> / <code>&lt;logTree&gt;</code> elements.</div>'}
+      </section>`;
+
+    this.refreshPriorPreview();
+    this.wirePriorRows();
+    this.wireOperatorRows();
+    this.wireMcmcRows();
+  }
+
+  /* Render the prior preview at the top of the sidebar.  The preview
+   * shows the currently selected prior's density curve, with the
+   * field values layered on top of the parsed XML so the user can see
+   * the curve update as they edit. */
+  refreshPriorPreview() {
+    const preview = this.root.querySelector('#mcmc-prior-preview');
+    if (!preview) return;
+    const p = this.findPrior(this.selectedPrior);
+    if (!p) { preview.innerHTML = ''; return; }
+    const kind = p.dist.replace(/Prior$/, '');
+    const base = readPriorAttrsFromDoc(this.doc, p.dist, p.targetId, p.index);
+    const pending = this.priorPreviewValues[p.key] || {};
+    const vals = Object.assign({ kind }, base || {}, pending);
+    const info = PRIOR_INFO[kind] || { label: kind, text: '' };
+    preview.innerHTML = `
+      <div class="mpp-head">
+        <strong>${esc(info.label)}</strong>
+        <code>${esc(p.targetId)}</code>
+      </div>
+      <div class="mpp-plot">${priorPdfSvg(vals)}</div>
+      <p class="mpp-info">${esc(info.text || '')}</p>`;
+  }
+
+  findPrior(key) {
+    if (!this.model || !key) return null;
+    return findPriorByKey(this.model, key);
+  }
+
+  selectPrior(key) {
+    if (this.selectedPrior === key) return;
+    this.selectedPrior = key;
+    this.selectRow('pri:' + key);
+    this.refreshPriorPreview();
+  }
+
+  /* Mark a row as the active sidebar row.  Clears the highlight on
+   * all other rows and applies it to the matching one.  Used by
+   * click handlers across priors, operators, mcmc, and logs. */
+  selectRow(key) {
+    if (!this.root) return;
+    if (this.selectedRowKey === key) return;
+    this.selectedRowKey = key;
+    for (const row of this.root.querySelectorAll('.slot')) {
+      row.classList.remove('selected');
+    }
+    if (!key) return;
+    const sel = this.root.querySelector(`.slot[data-row-key="${cssEscape(key)}"]`);
+    if (sel) sel.classList.add('selected');
+  }
+
+  operatorRow(op, i) {
+    const spec = operatorFields();
+    return `
+      <div class="slot" data-op-row="${i}" data-tag="${esc(op.tag)}"
+           data-target="${esc(op.targetId)}" data-row-key="op:${i}" tabindex="0"
+           title="Click to jump to this operator in the source XML">
+        <div class="slot-head">
+          <strong>${esc(op.tag)}</strong>
+          <code class="slot-target">${esc(op.targetId)}</code>
+        </div>
+        <div class="slot-form">
+          ${attrInputs(spec, op.attrs, 'op')}
+        </div>
+      </div>`;
+  }
+
+  /* Render a single prior as a row.  The row is clickable to select
+   * the prior (showing its preview at the top of the sidebar) and to
+   * jump to its location in the source XML. */
+  priorRow(p, isSelected) {
+    const distKind = p.dist.replace(/Prior$/, '');
+    const info = PRIOR_INFO[distKind] || { label: distKind, text: '' };
+    const isCtmc = distKind === 'ctmcScale';
+    const spec = isCtmc ? [] : priorFields(distKind);
+    return `
+      <div class="slot ${isSelected ? 'selected' : ''}"
+           data-pri-row="0" data-pri-key="${esc(p.key)}"
+           data-dist="${esc(p.dist)}" data-target="${esc(p.targetId)}"
+           data-index="${p.index}" data-row-key="pri:${esc(p.key)}" tabindex="0"
+           title="Click to select and jump to this prior in the source XML">
+        <div class="slot-head">
+          <strong>${esc(info.label)}</strong>
+          <code class="slot-target">${esc(p.targetId)}</code>
+        </div>
+        <div class="slot-form">
+          ${spec.length ? attrInputs(spec, p.attrs, 'pri') :
+            '<div class="hint">No editable parameters.</div>'}
+        </div>
+      </div>`;
+  }
+
+  mcmcRow(attrs) {
+    const obj = Object.fromEntries(attrs);
+    const spec = [
+      { key: 'chainLength', label: 'chainLength', type: 'number' },
+      { key: 'autoOptimize', label: 'autoOptimize', type: 'select', options: ['true', 'false'] },
+      { key: 'preBurnin', label: 'preBurnin', type: 'number' },
+    ];
+    return `<div class="slot" data-mcmc-row="" data-row-key="mcmc" tabindex="0"
+       title="Click to jump to &lt;mcmc&gt; in the source XML">
+      <div class="slot-head"><strong>&lt;mcmc&gt;</strong></div>
+      <div class="slot-form">${attrInputs(spec, obj, 'mcmc')}</div>
+    </div>`;
+  }
+
+  logRow(lg, i) {
+    return `
+      <div class="slot" data-log-row="${i}" data-kind="${esc(lg.kind)}"
+           data-row-key="log:${i}" tabindex="0"
+           title="Click to jump to this &lt;${esc(lg.kind)}&gt; in the source XML">
+        <div class="slot-head"><strong>&lt;${esc(lg.kind)}&gt;</strong></div>
+        <div class="slot-form">
+          <label>logEvery</label>
+          <input type="number" data-log="" data-key="logEvery"
+                 value="${esc(lg.logEvery || '')}">
+          ${lg.fileName ? `<label>fileName</label>
+            <input type="text" data-log="" data-key="fileName"
+                   value="${esc(lg.fileName)}">` : ''}
+        </div>
+      </div>`;
+  }
+
+  wireOperatorRows() {
+    /* Pre-compute the (tag, target, i) triples for each operator in
+     * the same order they appear in the sidebar, so row clicks can
+     * look up the right i-th occurrence. */
+    const operators = collectOperators(this.model);
+    for (const row of this.root.querySelectorAll('[data-op-row]')) {
+      const rowIndex = +row.dataset.opRow;
+      const op = operators[rowIndex];
+      if (!op) continue;
+      const { tag, targetId, index: i } = op;
+      row.querySelectorAll('[data-op]').forEach(inp => {
+        inp.addEventListener('focus', () => this.selectRow('op:' + rowIndex));
+        inp.addEventListener('change', () => {
+          this.selectRow('op:' + rowIndex);
+          this.commit(xml =>
+            applyOperatorEdit(xml, tag, targetId, i, inp.dataset.key, inp.value));
+        });
       });
-    });
+      /* Click on the row header (not the form fields) jumps to the
+       * operator's location in the source XML.  Clicks inside the
+       * form fall through to the input. */
+      const head = row.querySelector('.slot-head');
+      if (head) {
+        head.style.cursor = 'pointer';
+        head.addEventListener('click', e => {
+          if (e.target.closest('input, select, textarea, label')) return;
+          this.selectRow('op:' + rowIndex);
+          this.jumpToElement(tag, targetId, i);
+        });
+      }
+    }
   }
-}
 
-function wireMcmcRows(editor, root) {
-  for (const inp of root.querySelectorAll('[data-mcmc]')) {
-    inp.addEventListener('change', () => {
-      editor.commit(xml =>
-        applyMcmcEdit(xml, inp.dataset.key, inp.value));
-    });
+  /* Wire prior rows.  Clicking the row head selects the prior and
+   * jumps to its source location; typing in a form field updates the
+   * live preview when the prior is selected. */
+  wirePriorRows() {
+    for (const row of this.root.querySelectorAll('[data-pri-row]')) {
+      const key = row.dataset.priKey;
+      const dist = row.dataset.dist;
+      const target = row.dataset.target;
+      const idx = +row.dataset.index;
+      row.querySelectorAll('[data-pri]').forEach(inp => {
+        const fieldKey = inp.dataset.key;
+        const commit = () => {
+          const result = this.commit(xml =>
+            applyPriorEdit(xml, dist, target, idx, fieldKey, inp.value));
+          if (result === null && inp.value !== '') {
+            this.onEditError(
+              `${dist} on ${target}: attribute "${fieldKey}" was not applied`);
+          }
+          /* Clear the pending value so the preview falls back to
+           * the freshly parsed XML. */
+          if (this.priorPreviewValues[key]) {
+            delete this.priorPreviewValues[key][fieldKey];
+          }
+          this.refreshPriorPreview();
+        };
+        let timer = null;
+        inp.addEventListener('input', () => {
+          /* Layer the in-progress value on top of the parsed XML
+           * so the preview updates as the user types. */
+          this.priorPreviewValues[key] = this.priorPreviewValues[key] || {};
+          this.priorPreviewValues[key][fieldKey] = inp.value;
+          this.selectPrior(key);
+          this.refreshPriorPreview();
+          if (timer) clearTimeout(timer);
+          timer = setTimeout(() => { timer = null; commit(); }, 600);
+        });
+        inp.addEventListener('change', commit);
+        inp.addEventListener('keydown', e => {
+          if (e.key === 'Enter') {
+            e.preventDefault();
+            if (timer) { clearTimeout(timer); timer = null; }
+            commit();
+            inp.blur();
+          }
+        });
+      });
+      /* Click on the row head (not the form fields) selects the prior
+       * and jumps to its source location. */
+      const head = row.querySelector('.slot-head');
+      if (head) {
+        head.style.cursor = 'pointer';
+        head.addEventListener('click', e => {
+          if (e.target.closest('input, select, textarea, label')) return;
+          this.selectPrior(key);  // also calls selectRow internally
+          this.jumpToElement(dist, target, idx);
+        });
+      }
+    }
   }
-  for (const inp of root.querySelectorAll('[data-log]')) {
-    inp.addEventListener('change', () => {
-      const kind = inp.closest('[data-log-row]').dataset.kind;
-      editor.commit(xml =>
-        applyLogEdit(xml, kind, inp.dataset.key, inp.value));
-    });
-  }
-}
 
-function esc(s) {
-  return String(s).replace(/[&<>"']/g, c =>
-    ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+  /* Resolve the i-th element of (tagName, targetId) to a source line
+   * and ask the host to jump there. */
+  jumpToElement(tagName, targetId, i) {
+    const line = findElementLine(this.xmlText, tagName, targetId, i);
+    if (line != null) this.onJumpToLine(line);
+  }
+
+  wireMcmcRows() {
+    for (const inp of this.root.querySelectorAll('[data-mcmc]')) {
+      inp.addEventListener('focus', () => this.selectRow('mcmc'));
+      inp.addEventListener('change', () => {
+        this.selectRow('mcmc');
+        this.commit(xml =>
+          applyMcmcEdit(xml, inp.dataset.key, inp.value));
+      });
+    }
+    for (const inp of this.root.querySelectorAll('[data-log]')) {
+      const row = inp.closest('[data-log-row]');
+      const rowKey = 'log:' + row.dataset.logRow;
+      inp.addEventListener('focus', () => this.selectRow(rowKey));
+      inp.addEventListener('change', () => {
+        this.selectRow(rowKey);
+        const kind = row.dataset.kind;
+        this.commit(xml =>
+          applyLogEdit(xml, kind, inp.dataset.key, inp.value));
+      });
+    }
+    /* Click on the <mcmc> row header jumps to the <mcmc> element's
+     * source line.  The <mcmc> element is the only one of its kind. */
+    const mcmcRow = this.root.querySelector('[data-mcmc-row]');
+    if (mcmcRow) {
+      const head = mcmcRow.querySelector('.slot-head');
+      if (head) {
+        head.style.cursor = 'pointer';
+        head.addEventListener('click', e => {
+          if (e.target.closest('input, select, textarea, label')) return;
+          this.selectRow('mcmc');
+          const line = findElementLine(this.xmlText, 'mcmc', null, 0);
+          if (line != null) this.onJumpToLine(line);
+        });
+      }
+    }
+    /* Click on a <log> or <logTree> row header jumps to the i-th
+     * <log> or <logTree> element's source line. */
+    const logRows = this.root.querySelectorAll('[data-log-row]');
+    /* Group by kind to compute the i-th occurrence of each kind. */
+    const seenByKind = new Map();
+    logRows.forEach(row => {
+      const kind = row.dataset.kind;
+      const i = seenByKind.get(kind) || 0;
+      seenByKind.set(kind, i + 1);
+      const head = row.querySelector('.slot-head');
+      if (head) {
+        head.style.cursor = 'pointer';
+        head.addEventListener('click', e => {
+          if (e.target.closest('input, select, textarea, label')) return;
+          this.selectRow('log:' + i);
+          const line = findElementLine(this.xmlText, kind, null, i);
+          if (line != null) this.onJumpToLine(line);
+        });
+      }
+    });
+  }
+
+  commit(mutator) {
+    const next = mutator(this.xmlText);
+    if (next == null) return null;
+    this.xmlText = next;
+    try {
+      this.doc = parseXml(next);
+    } catch (e) {
+      this.onApply(next, e);
+      return null;
+    }
+    this.onApply(next, null);
+    return next;
+  }
 }

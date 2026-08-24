@@ -14,6 +14,10 @@ const esc = s => String(s).replace(/[&<>]/g, c =>
 export class SourceView {
   constructor(el) {
     this.el = el;
+    /* When the source pane hosts a sidebar (the MCMC editor), the
+     * SourceView renders into a dedicated child element so the
+     * sidebar is preserved across re-renders. */
+    this.bodyEl = el.querySelector('.source-body') || el;
     this.lines = [];
     this.activeId = null;
     this.hoverId = null;
@@ -41,7 +45,7 @@ export class SourceView {
         <span class="ln">${lineNo}</span><span class="code">${finalStyled || '&nbsp;'}</span>
       </div>`;
     }).join('');
-    this.el.innerHTML = head + `<pre class="src-body">${body}</pre>`;
+    this.bodyEl.innerHTML = head + `<div class="src-body">${body}</div>`;
   }
   /* nodeRange: { line, endLine } from parser */
   highlightId(node, opts = {}) {

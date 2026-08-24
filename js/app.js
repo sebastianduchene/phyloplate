@@ -5,7 +5,7 @@ import {
   SourceView, Search, renderAudit, wireAuditClicks,
   diffModels, renderDiff, exportBN,
 } from './extras.js';
-import { McmcEditor } from './mcmc-editor.js';
+import { McmcEditor, PriorDock } from './mcmc-editor.js';
 
 const $ = id => document.getElementById(id);
 
@@ -81,6 +81,15 @@ function load(text, name) {
   currentName = name;
   currentModel = model;
   currentText = text;
+  /* Tear down the live editors so the next time the user opens
+   * the Source tab, a fresh McmcEditor is built from this new
+   * model.  Re-using the old instance would leave the rendered
+   * form rows showing the previous model's parameters. */
+  if (mcmcEditor) {
+    mcmcEditor.root.innerHTML = '';
+    mcmcEditor = null;
+  }
+  closePriorDock();
   drop.style.display = 'none';
   aside.classList.remove('empty');
   $('tabs').hidden = false;
@@ -90,7 +99,7 @@ function load(text, name) {
   $('filename').textContent = name;
   $('filename').title = name;
   for (const b of ['btn-expand', 'btn-collapse', 'btn-reset',
-                    'btn-svg', 'btn-clear', 'btn-bn', 'btn-edit']) {
+                    'btn-svg', 'btn-clear', 'btn-bn', 'btn-mcmc-export']) {
     $(b).disabled = false;
   }
   search.model = model;
@@ -102,7 +111,16 @@ function load(text, name) {
                          id: n.id }, { dimOthers: true });
   };
   view.onPick = n => {
-    if (!n || !n.xmlLine) return;
+    if (!n) return;
+    /* Click on a prior's hyperparameter square, or on a parameter that
+     * has priors: open the right-docked prior editor.  Everything else
+     * falls back to the source view (the existing behaviour). */
+    const target = priorTargetOf(n, model);
+    if (target) {
+      openPriorDock(n, target);
+      return;
+    }
+    if (!n.xmlLine) return;
     showTab('source');
     source.highlightId({ line: n.xmlLine, endLine: n.xmlEndLine,
                          id: n.id }, { dimOthers: false, scroll: true });
@@ -143,6 +161,24 @@ function showTab(which) {
   $('notation').hidden = which !== 'notation';
   for (const el of document.querySelectorAll('.diagram-only')) {
     el.style.display = (which === 'diagram' || which === 'source') ? '' : 'none';
+  }
+  /* The prior dock is part of the diagram tab \u2014 hide it whenever the
+   * user moves to a different tab so it doesn't bleed over. */
+  if (which !== 'diagram' && priorDock) {
+    priorDock.root.hidden = true;
+  } else if (which === 'diagram' && priorDock && priorDock.prior) {
+    priorDock.root.hidden = false;
+  }
+  /* Lazily populate the MCMC sidebar inside the Source tab the first
+   * time the user opens it.  Subsequent visits just sync the model so
+   * the inputs reflect any prior edits. */
+  if (which === 'source' && currentModel) {
+    if (!mcmcEditor) {
+      ensureMcmcEditor();
+      mcmcEditor.open(currentModel, currentText);
+    } else {
+      mcmcEditor.sync(currentModel, currentText);
+    }
   }
 }
 
@@ -434,9 +470,18 @@ $('btn-clear').onclick = () => {
   currentModel = null;
   currentText = null;
   compareModel = null;
-  closeEditor();
+  closePriorDock();
+  /* Tear down the McmcEditor so the next source-tab visit builds a
+   * fresh one.  Re-using the old instance with a new model would
+   * leave the rendered DOM in the previous model's state and crash
+   * the next `refreshPriorPreview` call (which can't find its
+   * preview div). */
+  if (mcmcEditor) {
+    mcmcEditor.root.innerHTML = '';
+    mcmcEditor = null;
+  }
   for (const b of ['btn-expand', 'btn-collapse', 'btn-reset',
-                    'btn-svg', 'btn-clear', 'btn-bn', 'btn-edit']) {
+                    'btn-svg', 'btn-clear', 'btn-bn', 'btn-mcmc-export']) {
     $(b).disabled = true;
   }
   $('search').value = '';
@@ -559,79 +604,134 @@ $('drawer-backdrop').onclick = () => aside.classList.remove('drawer-open');
 
 // ----------------------------------------------------------------- editor
 
-/* The MCMC editor: a side panel that opens on top of the canvas and edits
- * priors / operators / MCMC params on the *loaded* model.  No templates,
- * no model construction, no FASTA drop.  Changes mutate the XML, re-parse,
- * and re-render the diagram. */
-let editor = null;
-function openEditor() {
+/* Two editor surfaces:
+ *
+ *  - `PriorDock` lives in the right-docked panel.  It opens when the user
+ *    clicks a prior's hyperparameter square or a parameter that has
+ *    priors, and shows one prior's preview + form side by side.
+ *
+ *  - `McmcEditor` fills the Edit MCMC tab.  It lists every operator and
+ *    exposes the <mcmc>, <log>, and <logTree> elements for editing.
+ *
+ * Both call `applyEdits(xml, err, stayOnDock?)` on commit, which
+ * re-parses the XML, refreshes the diagram / source / notation / sidebar,
+ * and keeps the dock open (if applicable). */
+let priorDock = null;
+let mcmcEditor = null;
+
+function priorTargetOf(node, model) {
+  if (!node || !model) return null;
+  /* Hyperparameter squares (parsed by parse-beast.js for every prior)
+   * carry `hyperTarget` pointing at the parameter they constrain. */
+  if (node.isHyper && node.hyperTarget) {
+    return { targetId: node.hyperTarget, dist: node.tag, hyperNode: node };
+  }
+  /* Clicking the parameter node itself: open the first prior on it. */
+  if (node.priors && node.priors.length) {
+    return { targetId: node.id, dist: node.priors[0].dist, hyperNode: null };
+  }
+  return null;
+}
+
+function openPriorDock(node, target) {
   if (!currentModel || !currentText) return;
-  $('svg').style.display = 'none';
-  $('source').hidden = true;
-  $('compare').hidden = true;
-  $('notation').hidden = true;
-  $('toolbar').hidden = true;
-  $('tabs').hidden = true;
-  $('mcmc-editor').hidden = false;
-  if (!editor) {
-    editor = new McmcEditor($('mcmc-editor'), {
-      onEditError: (msg) => {
-        /* The editor could not apply an edit (e.g. the prior element
-         * was not found in the parsed XML).  Show the user a status
-         * message rather than silently swallowing the failure. */
-        statusFlash('Edit failed: ' + msg, 3000);
-      },
-      onApply: (xml, parseError) => {
-        /* The editor mutated the XML; update the stored text and re-render
-         * the viewer.  If the edit broke parsing, show the source view so
-         * the user sees the broken XML. */
-        currentText = xml;
-        source.setSource(xml);
-        if (parseError) {
-          statusFlash('XML did not re-parse: ' + parseError.message, 3000);
-          return;
-        }
-        try {
-          const model = parseBeastXML(xml);
-          if (!model.nodes.length) throw new Error('no nodes');
-          model.meta.fileName = currentName;
-          currentModel = model;
-          search.model = model;
-          view.setModel(model);
-          try {
-            notation = buildNotation(model);
-            renderNotation(notation, $('notation'));
-          } catch { notation = null; }
-          renderSidebar(model);
-          /* Update the editor's model so subsequent commits use the new
-           * priors/operators list, but DON'T rebuild the editor DOM —
-           * doing so would steal focus from the input the user is typing
-           * in.  Existing rows are still correct because we only edit
-           * attribute values, not the prior/operator set itself. */
-          editor.model = model;
-        } catch (e) {
-          statusFlash('XML did not re-parse: ' + e.message, 3000);
-        }
-      },
-      onClose: closeEditor,
+  if (!priorDock) {
+    priorDock = new PriorDock($('prior-dock'), {
+      onClose: () => { /* no-op; close button handles teardown */ },
+      onEditError: (msg) => statusFlash('Edit failed: ' + msg, 3000),
+      onApply: (xml, parseError) => applyEdits(xml, parseError, /*stayOnDock=*/true),
     });
   }
-  editor.open(currentModel, currentText);
+  /* Resolve the prior entry.  If the user clicked the parameter node,
+   * `target.dist` is the first prior's tag.  If the user clicked a
+   * hyperparameter square, `target.dist` is the prior's dist name. */
+  const priors = currentModel.nodes
+    .find(n => n.id === target.targetId)?.priors || [];
+  const match = priors.find(p => p.dist === target.dist) || priors[0];
+  if (!match) return;
+  /* Build a stable entry identical to what the old editor used. */
+  const entry = {
+    key: `pri-${target.targetId}-${match.dist}-0`,
+    dist: match.dist,
+    targetId: target.targetId,
+    attrs: match.attrs,
+    index: 0,
+    label: match.label || target.targetId,
+  };
+  priorDock.open(currentModel, currentText, entry);
+  showTab('diagram');
 }
-function closeEditor() {
-  $('mcmc-editor').hidden = true;
-  $('mcmc-editor').innerHTML = '';
-  editor = null;
-  if (currentModel) {
-    $('tabs').hidden = false;
-    $('toolbar').hidden = false;
-    showTab('diagram');
-  } else {
-    $('drop').style.display = '';
+
+function closePriorDock() {
+  if (!priorDock) return;
+  priorDock.root.hidden = true;
+  priorDock.prior = null;
+}
+
+function ensureMcmcEditor() {
+  if (mcmcEditor) return mcmcEditor;
+  /* The MCMC form is rendered into the right sidebar of the Source
+   * tab so the user can edit priors, operators, and chain settings
+   * while watching the underlying XML update. */
+  mcmcEditor = new McmcEditor($('source-mcmc'), {
+    onEditError: (msg) => statusFlash('Edit failed: ' + msg, 3000),
+    onApply: (xml, parseError) => applyEdits(xml, parseError, /*stayOnDock=*/false),
+    onJumpToLine: (line) => {
+      if (!line) return;
+      showTab('source');
+      source.highlightId({ line, endLine: line, id: '(jump)' },
+                        { dimOthers: true, scroll: true });
+    },
+  });
+  return mcmcEditor;
+}
+
+function applyEdits(xml, parseError, stayOnDock) {
+  currentText = xml;
+  source.setSource(xml);
+  if (parseError) {
+    statusFlash('XML did not re-parse: ' + parseError.message, 3000);
+    return;
+  }
+  try {
+    const model = parseBeastXML(xml);
+    if (!model.nodes.length) throw new Error('no nodes');
+    model.meta.fileName = currentName;
+    currentModel = model;
+    search.model = model;
+    view.setModel(model);
+    try {
+      notation = buildNotation(model);
+      renderNotation(notation, $('notation'));
+    } catch { notation = null; }
+    renderSidebar(model);
+    /* Sync the live editors with the new model so subsequent commits use
+     * fresh priors/operators.  We avoid a full re-render of the active
+     * editor: that would steal focus from the input the user is typing
+     * in.  The dock and tab keep their current selection; the underlying
+     * model just gets refreshed. */
+    if (stayOnDock && priorDock) {
+      priorDock.sync(model, xml);
+    }
+    if (mcmcEditor) {
+      mcmcEditor.sync(model, xml);
+    }
+  } catch (e) {
+    statusFlash('XML did not re-parse: ' + e.message, 3000);
   }
 }
 
-$('btn-edit').onclick = () => openEditor();
+/* The "Export XML" button in the Edit MCMC tab downloads the current
+ * (possibly edited) XML. */
+$('btn-mcmc-export').onclick = () => {
+  if (!currentText) return;
+  const blob = new Blob([currentText], { type: 'application/xml' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = (currentName || 'model').replace(/\.xml$/i, '') + '_edited.xml';
+  a.click();
+  URL.revokeObjectURL(a.href);
+};
 
 // ----------------------------------------------------------------- boot
 
