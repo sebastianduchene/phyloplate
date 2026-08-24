@@ -6,7 +6,8 @@ and probabilistic notation. Originally a viewer; expanded earlier sessions to
 also generate XML from templates (the *builder*).  The builder was removed;
 the webapp is now viewer + editor of an existing model.
 
-Repo: `/mnt/c/Users/john/Documents/PhD/Dev/phyloplate`
+Repo: `/mnt/c/Users/john/Documents/PhD/Dev/phyloplate` (also live at
+`https://github.com/EDIDPasteur/phyloplate`).
 
 User: John H. Tay (jtay). Branch: `test`.
 
@@ -31,7 +32,7 @@ js/layout.js        layered DAG layout (Sugiyama-lite) with plate compaction
 js/render.js        D3 drawing, drag/zoom, tooltips, SVG export
 js/notation.js      DAG -> posterior factorisation + per-factor statements + LaTeX
 js/extras.js        SourceView, audit panel, Search, diffModels, exportBN
-js/mcmc-editor.js   PriorDock (right-docked) + McmcEditor (Edit MCMC tab)
+js/mcmc-editor.js   PriorDock (right-docked) + McmcEditor (Source-tab sidebar)
 js/d3.v7.min.js     vendored
 ```
 
@@ -107,12 +108,55 @@ Enter.
 
 ### Other
 
-- Tab order is now Diagram → Edit MCMC → Source → Notation.  Keyboard
-  shortcuts: 1 = Diagram, 2 = Edit MCMC, 3 = Source, 4 = Notation.
-- Removed header button `Edit priors & MCMC` (`#btn-edit`) and the
-  old `#mcmc-editor` container.
-- `state.flash` messages surface edit failures and parse errors via
-  the existing `statusFlash` helper.
+- Tab order is now Diagram → Source → Notation.  Keyboard shortcuts:
+  1 = Diagram, 2 = Source, 3 = Notation.
+- Removed the standalone `Edit MCMC` tab and header button
+  `#btn-edit`.  MCMC editing lives in the right sidebar of the
+  Source tab.  Removed the old `#mcmc-editor` container.
+- `statusFlash` messages surface edit failures and parse errors via
+  the existing helper.
+
+### Click-to-jump on every sidebar row
+
+The McmcEditor sidebar lists priors, operators, `<mcmc>`, and
+`<log>` / `<logTree>` elements.  Every row has a clickable header
+(the slot name + target id) and a `data-row-key`.  Clicking a
+header:
+1. Highlights that row in orange (matching the prior-row visual
+   that was already there).
+2. Jumps the source view to the matching XML line via the
+   `onJumpToLine` callback.  `app.js` switches to the Source tab
+   and calls `source.highlightId({ line, endLine: line, id: '(jump)' }, ...)`.
+
+The host (`app.js`) wires the callback; the McmcEditor doesn't
+know about tabs.  The diagram's right-docked `PriorDock` is
+unchanged (still used for the larger preview when clicking a prior
+node directly in the diagram).
+
+### Source tab layout
+
+The Source tab is a horizontal split:
+- **Left:** the source XML in a line-numbered `<div class="src-body">`
+  container.  No more `<pre>` wrapping (which leaked whitespace into
+  the layout).  Hover highlights, click-to-jump from a node, and
+  audit-panel row clicks all still work.
+- **Right (340 px sidebar):** the McmcEditor with a live prior preview
+  at the top, then sections for Priors, Operators, MCMC, and Logs.
+  An "Export XML" button in the tab bar downloads the edited file.
+
+On narrow viewports (≤920 px) the sidebar drops below the body.
+
+### Auto-cleanup on reload
+
+`load()` and `btn-clear` now tear down the McmcEditor
+(`root.innerHTML = ''` and `mcmcEditor = null`).  Without this,
+loading a new model and visiting the Source tab would re-use the
+old McmcEditor instance, which still has the previous model's
+rendered DOM and only the model/xmlText fields updated — the
+form fields would show the wrong parameters.  Defensive
+null-guards were also added at the top of `render()` so a stale
+render cannot throw "Cannot set properties of null (setting
+innerHTML)".
 
 ## Other direction notes
 
@@ -126,7 +170,7 @@ The viewer is unchanged. Features it has (added in previous sessions):
 - Theme toggle (◐ in header): light / dark / auto (follows prefers-color-scheme).
 - Wider sidebar (320 px) with module list, view toggles, audit, legend.
 - Inline canvas toolbar (fit, zoom, search, modules, machinery).
-- Keyboard shortcuts: F, +/=, −/_, /, M, G, 1/2/3/4, R, Esc.
+- Keyboard shortcuts: F, +/=, −/_, /, M, G, 1/2/3, R, Esc.
 - Sticky filename chip in the header.
 - Mobile drawer for the sidebar (≤920 px).
 - Notation collapsible sections.
@@ -160,9 +204,17 @@ The viewer is unchanged. Features it has (added in previous sessions):
   scans the element body for any idref — that handles `<ctmcScalePrior>`,
   `<upDownOperator>` with `<up>`/`<down>`, and `<subtreeSlide>` referencing
   a `<treeModel>`.
+- `findElementLine(text, tagName, targetId, i)` returns the source
+  line of the i-th element matching (tagName, targetId).  Used by
+  the McmcEditor's click-to-jump.
 - The editor only edits attribute values; it cannot add or remove priors,
   operators, or other elements.  Users wanting structural changes edit the
   XML in the Source tab.
+- Operator rows are deduped by `(tag, targetId)` so the i-th occurrence
+  is what's passed to `setAttrOnElement` / `findElementLine`.  Click
+  handlers read the operator's own `i` from the in-memory operators
+  list, not the row index, so a click always targets the right
+  element.
 
 ## Things deferred / known limitations
 
