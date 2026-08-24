@@ -47,6 +47,9 @@ const FACTOR_NAME = {
  * nothing is asserted that the XML does not say. */
 function algebraicForm(n, parents, sym, bare) {
   const t = n.tag, a = n.attrs || {};
+  const findP = (...tags) => parents.find(p => tags.includes(p.tag));
+  const nameOf = p => p ? bare(p.id) : null;
+
   if (t === 'arbitraryBranchRates') {
     const hasEffects = parents.some(p => p.tag === 'fixedEffects');
     const eps = parents.find(p => p.tag === 'parameter');
@@ -75,6 +78,168 @@ function algebraicForm(n, parents, sym, bare) {
       tex: 'r_j = F^{-1}\\!\\left(\\frac{c_j - 1/2}{n}\\right)',
       note: 'branch rates are the discretised quantiles of the parent ' +
             'distribution, indexed by the category assignment cⱼ.',
+    };
+  }
+  if (t === 'randomLocalClockModel') {
+    const indicator = findP('parameter');
+    const shift = findP('parameter');
+    return {
+      text: `rⱼ = r · exp( kᵢ · I[branch j ∈ clade i] )`,
+      tex: `r_j = r \\cdot \\exp(k_i \\cdot I[\\text{branch } j \\in \\text{clade } i])`,
+      note: 'random local clock: each clade indicator scales the strict-clock rate by exp(kᵢ).',
+    };
+  }
+  if (t === 'localClockModel') {
+    return {
+      text: 'rⱼ = r · sᵢ for branch j in clade i',
+      tex: 'r_j = r \\cdot s_i \\text{ for branch } j \\in \\text{clade } i',
+    };
+  }
+  if (t === 'mixedEffectsBranchRates') {
+    return {
+      text: 'log rⱼ = β₀ + Σₖ βₖ Xⱼₖ + εⱼ, εⱼ ~ Normal(0, σ²)',
+      tex: '\\log r_j = \\beta_0 + \\sum_k \\beta_k X_{jk} + \\epsilon_j,' +
+           '\\ \\epsilon_j \\sim \\mathcal{N}(0, \\sigma^2)',
+      note: 'mixed-effects clock: fixed effects Xⱼₖ plus lognormal random effects.',
+    };
+  }
+  if (t === 'countableMixtureBranchRates') {
+    return {
+      text: 'rⱼ ∈ { ρ₁, …, ρₖ } with mixture weights w = (w₁, …, wₖ)',
+      tex: 'r_j \\in \\{\\rho_1, \\dots, \\rho_k\\},\\ w = (w_1, \\dots, w_k)',
+    };
+  }
+  if (t === 'autoCorrelatedBranchRates') {
+    return {
+      text: 'rⱼ₊₁ | rⱼ ~ LogNormal(log rⱼ, σ²)',
+      tex: 'r_{j+1} \\mid r_j \\sim \\mathrm{LogNormal}(\\log r_j, \\sigma^2)',
+    };
+  }
+  if (t === 'compoundBranchRateModel') {
+    return {
+      text: 'rⱼ = rⱼ¹ · rⱼ² · …  (product of branch-rate components)',
+      tex: 'r_j = r_j^{(1)} \\cdot r_j^{(2)} \\cdots',
+    };
+  }
+  if (t === 'gammaSiteModel' || t === 'siteModel') {
+    if (parents.some(p => p.tag === 'gammaShape' || p.tag === 'parameter'
+                            && p.dimension === '1')) {
+      const cats = a.gammaCategories || parents.find(p => p.tag === 'gammaShape')
+                       ?.attrs?.gammaCategories;
+      return {
+        text: cats ? `rates ~ DiscreteGamma(α, ${cats} categories)`
+                   : 'rates ~ DiscreteGamma(α, n categories)',
+        tex: cats ? `\\mathrm{DiscreteGamma}(\\alpha, ${cats})`
+                  : '\\mathrm{DiscreteGamma}(\\alpha, n)',
+        note: 'ASRV: discretised gamma distribution of relative site rates.',
+      };
+    }
+  }
+  if (t === 'hkyModel') {
+    const kappa = findP('parameter');
+    const pi = parents.find(p => p.tag === 'frequencyModel');
+    const k = kappa ? nameOf(kappa) : 'κ';
+    return {
+      text: `Q_{ij} = πⱼ · (1 if i↔j transition, ${k} if transversion)`,
+      tex: `Q_{ij} = \\pi_j \\cdot (1\\ \\text{if } i \\leftrightarrow j\\ \\text{transition},\\ ${texOf(k)}\\ \\text{if transversion})`,
+      note: 'HKY: transition/transversion ratio κ against nucleotide frequencies π.',
+    };
+  }
+  if (t === 'gtrModel') {
+    return {
+      text: 'Q_{ij} = πⱼ · r_{ij} (six exchangeability rates, one fixed at 1)',
+      tex: 'Q_{ij} = \\pi_j \\cdot r_{ij}',
+      note: 'GTR: six exchangeability rates r_{ij} normalised so the matrix has unit rate.',
+    };
+  }
+  if (t === 'tn93Model') {
+    return {
+      text: 'Q_{ij} = πⱼ · (κ₁ if R↔Y transition, κ₂ if Y↔R, 1 if transversion)',
+      tex: 'Q_{ij} = \\pi_j \\cdot (\\kappa_1, \\kappa_2,\\ 1)',
+      note: 'TN93: two transition rates (purine and pyrimidine) and one transversion rate.',
+    };
+  }
+  if (t === 'jc69Model') {
+    return {
+      text: 'Q_{ij} = 1/4 for i ≠ j',
+      tex: 'Q_{ij} = 1/4 \\ (i \\neq j)',
+      note: 'JC69: equal frequencies, equal rates.',
+    };
+  }
+  if (t === 'yangCodonModel' || t === 'mgCodonModel' || t === 'codonModel') {
+    return {
+      text: 'substitutions scaled by κ (ts) and ω = dN/dS (nonsynonymous)',
+      tex: '\\mathrm{scaled\\ by}\\ \\kappa\\ (\\text{transition}),\\ \\omega\\ (\\text{nonsynonymous})',
+    };
+  }
+  if (t === 'constantSize') {
+    return {
+      text: 'N(t) = Nₑ (constant population size)',
+      tex: 'N(t) = N_e',
+    };
+  }
+  if (t === 'exponentialGrowth') {
+    const g = findP('parameter');
+    const gname = g ? nameOf(g) : 'g';
+    return {
+      text: `N(t) = N₀ · exp( −${gname} · t )`,
+      tex: `N(t) = N_0 \\cdot \\exp(-${texOf(gname)} \\cdot t)`,
+    };
+  }
+  if (t === 'logisticGrowth') {
+    return {
+      text: 'N(t) = N₀ · exp( ln(K/N₀ − 1) · (t − t₅₀)/τ )',
+      tex: 'N(t) = N_0 \\cdot \\exp\\bigl(\\ln(K/N_0 - 1) \\cdot (t - t_{50})/\\tau\\bigr)',
+    };
+  }
+  if (t === 'bayesianSkylineLikelihood') {
+    return {
+      text: 'N(t) piecewise constant over m skyline groups',
+      tex: 'N(t)\\ \\text{piecewise constant over } m \\text{ groups}',
+      note: 'BSP: population size changes at coalescent-interval group boundaries.',
+    };
+  }
+  if (t === 'gmrfSkyGridLikelihood' || t === 'gmrfSkyrideLikelihood'
+      || t === 'skyGridLikelihood') {
+    return {
+      text: 'log Nᵢ ~ GMRF(precision τ)',
+      tex: '\\log N_i \\sim \\mathrm{GMRF}(\\tau)',
+      note: 'Skygrid: log-population sizes follow a Gaussian Markov random field.',
+    };
+  }
+  if (t === 'coalescentLikelihood') {
+    return {
+      text: 'p(Ψ | N(t))  (Kingman\'s coalescent under N(t))',
+      tex: 'p(\\Psi \\mid N(t))',
+    };
+  }
+  if (t === 'speciationLikelihood' && parents.some(p => p.tag === 'yuleModel')) {
+    return {
+      text: 'p(Ψ | λ) = λ^{n−1} · exp(−λ · Σⱼ tⱼ)',
+      tex: 'p(\\Psi \\mid \\lambda) = \\lambda^{n-1} \\exp(-\\lambda \\sum_j t_j)',
+      note: 'Yule (pure-birth) speciation: branching rate λ, total branch length Σⱼ tⱼ.',
+    };
+  }
+  if (t === 'speciationLikelihood' && parents.some(p => p.tag === 'birthDeathModel')) {
+    return {
+      text: 'p(Ψ | λ, μ)  (birth-death serial-sampling process)',
+      tex: 'p(\\Psi \\mid \\lambda, \\mu)',
+    };
+  }
+  if (t === 'markovModulatedSubstitutionModel') {
+    const switching = findP('parameter');
+    const rs = findP('parameter');
+    return {
+      text: 'Λ = I_K ⊗ Q* + S ⊗ I_S   (compound CTMC)',
+      tex: '\\Lambda = I_K \\otimes Q^* + S \\otimes I_S',
+      note: 'MMM: K base models combined with switching process S; rates scaled by λₘ.',
+    };
+  }
+  if (t === 'epochBranchModel') {
+    return {
+      text: 'model = Mᵐ for branch in epoch m  (m = 1, …, M)',
+      tex: 'M = M^{(m)}\\ \\text{for branch in epoch } m',
+      note: 'Epoch model: substitution model changes at fixed transition times.',
     };
   }
   return null;
@@ -380,7 +545,7 @@ export function renderNotation(note, el) {
   <div class="notation">
 
     <section>
-      <h3>Posterior</h3>
+      <h3><span class="chevron"></span>Posterior</h3>
       <div class="eq-wrap"><div class="eq">${esc(note.posterior.text)}</div></div>
       <p class="note">Read from the <code>&lt;joint&gt;</code> block of the XML:
         every factor below is one child of <code>&lt;prior&gt;</code> or
@@ -389,17 +554,17 @@ export function renderNotation(note, el) {
     </section>
 
     ${likelihood.length ? `<section>
-      <h3>Likelihood</h3>
+      <h3><span class="chevron"></span>Likelihood</h3>
       <div class="stmts">${likelihood.map(t => stmt(t)).join('')}</div>
     </section>` : ''}
 
     ${prior.length ? `<section>
-      <h3>Prior</h3>
+      <h3><span class="chevron"></span>Prior</h3>
       <div class="stmts">${prior.map(t => stmt(t)).join('')}</div>
     </section>` : ''}
 
     ${note.deterministic.length ? `<section>
-      <h3>Deterministic</h3>
+      <h3><span class="chevron"></span>Deterministic</h3>
       <div class="stmts">${note.deterministic.map(d => stmt(d,
         (d.form ? `<div class="form">${esc(d.form.text)}${
           d.form.note ? `<span class="form-note">${esc(d.form.note)}</span>` : ''}</div>` : '') +
@@ -408,7 +573,7 @@ export function renderNotation(note, el) {
     </section>` : ''}
 
     ${note.constants.length ? `<section>
-      <h3>Fixed values</h3>
+      <h3><span class="chevron"></span>Fixed values</h3>
       <div class="stmts">${note.constants.map(c => `
         <div class="row"><div class="stmt">
           <span class="lhs">${esc(c.lhs)}</span>
@@ -419,7 +584,7 @@ export function renderNotation(note, el) {
     </section>` : ''}
 
     <section>
-      <h3>Symbols</h3>
+      <h3><span class="chevron"></span>Symbols</h3>
       <table class="glossary">
         <thead><tr><th>Symbol</th><th>BEAST id</th><th>Element</th><th>Kind</th></tr></thead>
         <tbody>${note.glossary.map(g => `<tr>
@@ -432,4 +597,9 @@ export function renderNotation(note, el) {
     </section>
 
   </div>`;
+
+  // Make the h3 collapse / expand the section body.
+  el.querySelectorAll('section > h3').forEach(h => {
+    h.onclick = () => h.parentElement.classList.toggle('collapsed');
+  });
 }
