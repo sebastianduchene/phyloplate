@@ -45,6 +45,7 @@
 <div class="app">
 
   <header class="bar">
+    <button class="aside-toggle" id="btn-aside" aria-label="Toggle sidebar">≡</button>
     <a class="brand" href="https://github.com/sebastianduchene/phyloplate"
        target="_blank" rel="noopener noreferrer"
        title="PhyloPlate on GitHub" aria-label="PhyloPlate on GitHub">
@@ -52,10 +53,13 @@
     </a>
     <h1>PhyloPlate</h1>
     <span class="sub">BEAST X models in plate notation</span>
+    <span class="filename" id="filename" hidden></span>
 
     <nav class="tabs" id="tabs" hidden>
       <button class="tab active" data-tab="diagram">Diagram</button>
+      <button class="tab" data-tab="source">Source</button>
       <button class="tab" data-tab="notation">Notation</button>
+      <button class="tab" data-tab="compare" id="tab-compare" hidden>Compare</button>
     </nav>
 
     <span class="spacer"></span>
@@ -64,15 +68,27 @@
       <button id="btn-collapse" disabled>Collapse modules</button>
       <button id="btn-reset" disabled>Reset view</button>
       <button id="btn-svg" disabled>Export SVG</button>
+      <button id="btn-bn" disabled>Export BN</button>
+    </span>
+    <span class="tab-tools" data-for="source" hidden>
+      <button id="btn-mcmc-export" disabled>Export XML</button>
     </span>
     <span class="tab-tools" data-for="notation" hidden>
       <button id="btn-latex">Copy LaTeX</button>
     </span>
+    <button id="btn-theme" class="theme-toggle" title="Toggle theme" aria-label="Toggle theme">◐</button>
     <button id="btn-clear" disabled>Load another</button>
   </header>
 
   <div class="main">
+    <div class="drawer-backdrop" id="drawer-backdrop" hidden></div>
     <aside id="aside" class="empty">
+      <div class="search-row" id="search-row" hidden>
+        <input type="search" id="search" placeholder="Find id, tag, or symbol…"
+               autocomplete="off" spellcheck="false">
+        <span class="search-count" id="search-count"></span>
+      </div>
+
       <h2>Model</h2>
       <div class="meta-grid" id="meta"></div>
 
@@ -90,6 +106,9 @@
       <div class="hint">Logged summary statistics and HMC gradient elements are
         inference machinery, not part of the generative model.</div>
 
+      <h2>Priors &amp; Operators</h2>
+      <div class="audit" id="audit"></div>
+
       <h2>Legend</h2>
       <div class="legend" id="legend"></div>
       </div>
@@ -97,7 +116,34 @@
 
     <div class="canvas" id="canvas">
       <svg id="svg"></svg>
+
+      <div class="source-pane" id="source" hidden>
+        <div class="source-body" id="source-body"></div>
+        <div class="source-mcmc" id="source-mcmc"></div>
+      </div>
+
+      <div class="diff-pane" id="compare" hidden></div>
+
       <div class="notation-pane" id="notation" hidden></div>
+
+      <div class="prior-dock" id="prior-dock" hidden>
+        <div class="prior-dock-head">
+          <span class="prior-dock-title">Prior editor</span>
+          <button class="prior-dock-close" id="prior-dock-close" aria-label="Close">&times;</button>
+        </div>
+        <div class="prior-dock-body" id="prior-dock-body"></div>
+      </div>
+
+      <div class="canvas-toolbar" id="toolbar" hidden>
+        <button class="tool" id="tb-fit"     title="Fit to view" data-hint="F">⤢</button>
+        <button class="tool" id="tb-zoom-in" title="Zoom in"     data-hint="+">+</button>
+        <button class="tool" id="tb-zoom-out" title="Zoom out"  data-hint="−">−</button>
+        <button class="tool" id="tb-search"  title="Search"      data-hint="/">⌕</button>
+        <div class="sep"></div>
+        <button class="tool" id="tb-modules"   title="Module outlines" data-hint="M">▢</button>
+        <button class="tool" id="tb-machinery" title="Show machinery"  data-hint="G">⚙</button>
+      </div>
+
       <div class="drop" id="drop">
         <img class="drop-mark" src="assets/logo.svg" alt="" width="96" height="96">
         <h2>Drop a BEAST X XML here</h2>
