@@ -354,6 +354,14 @@ export function parseBeastXML(text) {
     addNode(el, id);
   }
 
+  // Tree-internal parameters that have priors need nodes so hyperparameters can target them
+  for (const targetId of priorsOf.keys()) {
+    if (!nodes.has(targetId)) {
+      const el = byId.get(targetId);
+      if (el) addNode(el, targetId);
+    }
+  }
+
   // Anonymous <parameter> with a fixed value inside a model component:
   // these are the constant nodes of Fig. 2 (e.g. the mean of a Normal).
   let anon = 0;
