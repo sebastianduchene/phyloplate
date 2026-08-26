@@ -9,7 +9,8 @@
 Drop a BEAST X XML on the page and read the model back two ways: as a **plate
 diagram** in the notation of Höhna *et al.* (2014), and as the **written-out
 probabilistic model** — posterior factorisation, likelihood, priors, and
-deterministic transforms.
+deterministic transforms. Or click **Build new** to construct a model from a
+template and export the XML.
 
 Everything runs in your browser. Your XML is never uploaded; the page has no
 back end and makes no network requests once loaded.
@@ -84,6 +85,48 @@ rⱼ = ( Σₖ βₖ zⱼₖ ) · exp(εⱼ)
 
 ![The notation view](docs/img/notation.png)
 
+## Source view
+
+The **Source** tab shows the underlying XML with line numbers and a faint
+syntax colouring. Hover any node in the diagram and the matching lines
+highlight; click and the pane scrolls to the block. Useful when you want to
+read what the model actually says in BEAST's grammar, not just the abstracted
+graph.
+
+## Auditing priors and operators
+
+The sidebar lists every prior and every operator as compact tables, one row
+each. Click a row to focus the node and jump to its source line.
+
+## Searching
+
+Type into the sidebar search box to filter the diagram to nodes whose id, tag,
+or symbol matches. Press `Enter` to cycle matches; `Escape` to clear.
+
+## Comparing two models
+
+Right-click the canvas (or use a button) to load a second BEAST X file and
+diff the two DAGs. Added, removed, and changed (attribute-different) nodes
+and edges are reported in a new **Compare** tab.
+
+## Editing priors and MCMC parameters
+
+Once a model is loaded, click **Edit priors &amp; MCMC** in the header.  A
+side panel lists every prior and every operator in the file, grouped by
+target parameter, with form fields for the editable attributes.  The inline
+density plot next to each prior updates as you type; the larger plot opens
+in a popup for inspection.  `<mcmc>` and `<log>`/`<logTree>` rows expose
+`chainLength`, `autoOptimize`, `logEvery`, `fileName`, and so on.
+
+Edits go directly into the XML text in place — formatting, comments, and
+ordering of unrelated elements are preserved — and the diagram, notation,
+audit, and source view update from the new XML on every commit (i.e. on
+blur or Enter).
+
+The editor only edits attribute values on existing elements.  It does not
+add or remove priors, operators, or other model components; for that, edit
+the XML directly in the **Source** tab or in your editor of choice.
+
 ## Running it locally
 
 ```sh
@@ -134,11 +177,13 @@ drift apart.
 
 ```
 index.html          layout and controls
-css/style.css       Material teal/orange palette
+css/style.css       Material teal/orange palette (with dark mode)
 js/parse-beast.js   XML  -> typed DAG, modules, plates, posterior structure
 js/layout.js        layered DAG layout with plate compaction
 js/render.js        D3 drawing, drag, zoom, tooltips, SVG export
 js/notation.js      DAG  -> probabilistic notation and LaTeX
+js/extras.js        source view, audit, search, comparison, BN export
+js/mcmc-editor.js   prior / operator / MCMC editor (mutates XML in place)
 js/d3.v7.min.js     vendored, so the app works offline
 assets/             logo, icons and social card
 ```

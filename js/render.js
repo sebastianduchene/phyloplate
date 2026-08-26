@@ -49,6 +49,46 @@ export class DiagramView {
     this.draw();
   }
 
+  /** Search-time: dim everything but the matching nodes. */
+  highlightMatches(matches) {
+    if (!this.model) return;
+    const ids = new Set((matches || []).map(m => m.id));
+    this.svg.select('.zoom-root').selectAll('.node')
+      .classed('dim', d => matches && !ids.has(d.id));
+  }
+
+  /** Imperatively focus a node (hover-equivalent behaviour from outside). */
+  focusNode(id) {
+    if (!this.model) return;
+    const node = this.model.nodes.find(n => n.id === id);
+    if (!node) return;
+    const sel = this.svg.selectAll('.node').filter(d => d.id === id);
+    if (sel.empty()) return;
+    const ev = sel.node();
+    if (!ev) return;
+    const rect = ev.getBoundingClientRect();
+    // Build a real MouseEvent so the existing mouseenter handler runs.
+    const fakeEvent = new MouseEvent('mouseenter', {
+      bubbles: true,
+      clientX: rect.left + rect.width / 2,
+      clientY: rect.top + rect.height / 2,
+    });
+    ev.dispatchEvent(fakeEvent);
+  }
+
+  /** Fit the graph into the viewport. */
+  fitToView() {
+    if (!this.model) return false;
+    this.svg.transition().duration(250).call(this.zoom.transform, d3.zoomIdentity);
+    return true;
+  }
+
+  zoomBy(factor) {
+    if (!this.model) return false;
+    this.svg.transition().duration(150).call(this.zoom.scaleBy, factor);
+    return true;
+  }
+
   toggleModule(m) {
     this.collapsed.has(m) ? this.collapsed.delete(m) : this.collapsed.add(m);
     this.draw();
@@ -289,15 +329,21 @@ export class DiagramView {
             ? 'url(#arrow-hi)' : 'url(#arrow-dim)');
         nodeSel.classed('dim', n => n.id !== d.id && !touching.has(n.id));
         self.showTip(event, d);
+        // Notify other panes: source view can highlight this node's lines.
+        self.hoveredNode = d;
+        self.onHover?.(d);
       })
       .on('mousemove', function (event) { self.moveTip(event); })
       .on('mouseleave', function () {
         edgeSel.classed('hi', false).classed('dim', false).attr('marker-end', 'url(#arrow)');
         nodeSel.classed('dim', false);
         self.hideTip();
+        self.hoveredNode = null;
+        self.onHover?.(null);
       })
       .on('click', function (event, d) {
         if (d.type === 'module') { self.toggleModule(d.module); self.onChange?.(); }
+        self.onPick?.(d);
       });
 
     this.onChange?.();

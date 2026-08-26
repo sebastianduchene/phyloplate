@@ -481,10 +481,11 @@ export function parseBeastXML(text) {
   const posterior = readPosterior(doc, nodes, canon);
 
   // ---- record source line numbers for the tooltips
-  annotateLines(text, nodes);
+  annotateLines(text, nodes, doc);
 
   return {
     meta,
+    source: text,
     nodes: [...nodes.values()].map(({ el, ...rest }) => rest),
     edges,
     plates,
@@ -787,14 +788,49 @@ function detectPlates(nodes, edges) {
 
 // ---------------------------------------------------------------- extras
 
-function annotateLines(text, nodes) {
+function annotateLines(text, nodes, doc) {
+  // For every element with an id, record the line range of its source span so
+  // the Source view can highlight and jump to it.
   const lines = text.split('\n');
+  const offs = [0];
+  for (const ln of lines) offs.push(offs[offs.length - 1] + ln.length + 1);
+  const lineAt = off => {
+    let lo = 0, hi = offs.length - 1;
+    while (lo < hi) {
+      const mid = (lo + hi + 1) >> 1;
+      if (offs[mid] <= off) lo = mid; else hi = mid - 1;
+    }
+    return lo + 1;
+  };
   const index = new Map();
-  lines.forEach((ln, i) => {
-    const m = ln.match(/\bid="([^"]+)"/);
-    if (m && !index.has(m[1])) index.set(m[1], i + 1);
-  });
-  for (const n of nodes.values()) if (index.has(n.id)) n.xmlLine = index.get(n.id);
+  for (const el of doc.getElementsByTagName('*')) {
+    const id = el.getAttribute('id');
+    if (!id || index.has(id)) continue;
+    const idIdx = text.indexOf('id="' + id + '"');
+    if (idIdx < 0) continue;
+    const startOff = text.lastIndexOf('<', idIdx);
+    if (startOff < 0) continue;
+    const closeIdx = text.indexOf('</' + el.tagName + '>', idIdx);
+    const selfClose = text.indexOf('/>', idIdx);
+    let endOff;
+    if (closeIdx > 0 && (selfClose < 0 || closeIdx < selfClose)) {
+      endOff = closeIdx + ('</' + el.tagName + '>').length;
+    } else if (selfClose > 0) {
+      endOff = selfClose + 2;
+    } else {
+      endOff = startOff + text.slice(startOff).indexOf('>') + 1;
+    }
+    index.set(id, {
+      line: lineAt(startOff),
+      endLine: lineAt(Math.max(endOff - 1, startOff)),
+      start: startOff, end: endOff,
+    });
+  }
+  for (const n of nodes.values()) {
+    const loc = index.get(n.id);
+    if (loc) { n.xmlLine = loc.line; n.xmlEndLine = loc.endLine; n.xmlOffset = loc.start; }
+  }
+  return index;
 }
 
 function firstCommentMatching(doc, re) {
@@ -817,6 +853,13 @@ function summarise(nodes, doc) {
     const s = aln.querySelector('sequence');
     if (s) nchar = (s.textContent.match(/[A-Za-z\-?]/g) || []).length;
   }
+  const opCount = doc.getElementsByTagName('operators')[0]
+    ? [...doc.getElementsByTagName('operators')[0].children].filter(c => c.nodeType === 1).length
+    : 0;
+  let priorCount = 0;
+  for (const el of doc.getElementsByTagName('*')) {
+    if (PRIOR_TAGS.has(tagOf(el))) priorCount++;
+  }
   return {
     ntax: taxa ? taxa.getElementsByTagName('taxon').length : null,
     nchar,
@@ -826,5 +869,7 @@ function summarise(nodes, doc) {
     deterministic: count('deterministic'),
     clamped: count('clamped'),
     factor: count('factor'),
+    operators: opCount,
+    priors: priorCount,
   };
 }
