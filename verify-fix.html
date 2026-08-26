@@ -1,0 +1,89 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Verify Prior Fix</title>
+  <style>
+    body { font-family: monospace; padding: 20px; background: #f5f5f5; }
+    pre { background: white; padding: 15px; border-radius: 4px; overflow-x: auto; }
+    .pass { color: green; font-weight: bold; }
+    .fail { color: red; font-weight: bold; }
+  </style>
+</head>
+<body>
+  <h1>PhyloPlate Prior Fix Verification</h1>
+  <pre id="output"></pre>
+  <script type="module">
+    import { parseBeastXML } from './js/parse-beast.js';
+
+    const out = (msg) => {
+      const el = document.getElementById('output');
+      el.textContent += msg + '\n';
+      console.log(msg);
+    };
+
+    fetch('../varv_re_clock_prior.xml')
+      .then(r => r.text())
+      .then(xml => {
+        try {
+          const result = parseBeastXML(xml);
+          out(`✓ Parsing successful`);
+          out(`\n=== SUMMARY ===`);
+          out(`Total nodes: ${result.nodes.length}`);
+          out(`Total edges: ${result.edges.length}`);
+
+          // Find hyperparameter nodes
+          const hypers = result.nodes.filter(n => n.isHyper);
+          out(`Hyperparameter nodes: ${hypers.length}`);
+
+          // Count by prior type
+          const byType = {};
+          hypers.forEach(h => {
+            byType[h.tag] = (byType[h.tag] || 0) + 1;
+          });
+
+          out(`\n=== HYPERPARAMETERS BY TYPE ===`);
+          Object.entries(byType).sort().forEach(([type, count]) => {
+            out(`  ${type}: ${count}`);
+          });
+
+          // Show uniform priors on age parameters
+          const uniformOnAge = hypers.filter(h => h.tag === 'uniformPrior' && h.hyperTarget.startsWith('age('));
+          out(`\n=== UNIFORM PRIORS ON AGE PARAMETERS ===`);
+          out(`Found: ${uniformOnAge.length}`);
+          if (uniformOnAge.length > 0) {
+            out(`<span class="pass">✓ FIXED: Uniform priors now show up!</span>`);
+            uniformOnAge.slice(0, 5).forEach(h => {
+              out(`  - ${h.label} → ${h.hyperTarget}`);
+            });
+            if (uniformOnAge.length > 5) {
+              out(`  ... and ${uniformOnAge.length - 5} more`);
+            }
+          } else {
+            out(`<span class="fail">✗ FAILED: No uniform priors found on age parameters</span>`);
+          }
+
+          // Verify age parameters have nodes
+          out(`\n=== AGE PARAMETER NODES ===`);
+          const ageParams = result.nodes.filter(n => n.id.startsWith('age('));
+          out(`Found: ${ageParams.length}`);
+          if (ageParams.length > 0) {
+            out(`<span class="pass">✓ Age parameters now have nodes</span>`);
+            ageParams.slice(0, 3).forEach(p => {
+              out(`  - ${p.id} (type: ${p.type})`);
+            });
+            if (ageParams.length > 3) {
+              out(`  ... and ${ageParams.length - 3} more`);
+            }
+          } else {
+            out(`<span class="fail">✗ No age parameter nodes found</span>`);
+          }
+
+        } catch (e) {
+          out(`<span class="fail">✗ Error: ${e.message}</span>`);
+          out(e.stack);
+        }
+      })
+      .catch(e => out(`<span class="fail">✗ Fetch error: ${e.message}</span>`));
+  </script>
+</body>
+</html>
